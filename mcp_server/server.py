@@ -3,6 +3,9 @@
 Tools:
   search_flights(origin, dest, date, cabin="economy", adults=1, currency="USD")
   rank(options, prefs={})
+  cpp_value(points, program, cash_price)
+  bonus_watch()
+  cheap_hack(origin, dests, dates, flags={})
 
 Primary: faster-flights (live Google Flights scrape, $0, no key).
 Fallback: SerpAPI Google Flights (optional SERPAPI_KEY, 250 free/mo).
@@ -246,6 +249,95 @@ def _rank_impl(options, prefs=None):
     return ranked
 
 
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+
+
+def _load_json(name):
+    try:
+        return json.loads((DATA_DIR / name).read_text())
+    except Exception as e:  # noqa: BLE001
+        return {"_error": str(e)}
+
+
+def _cpp_impl(points, program, cash_price):
+    d = _load_json("cpp.json")
+    if "_error" in d:
+        return {"error": f"cpp.json unreadable: {d['_error']}"}
+    want = (program or "").strip().lower()
+    hit = None
+    for p in d.get("programs", []):
+        names = [p.get("program", "").lower()] + [a.lower() for a in p.get("aliases", [])]
+        if want in names:
+            hit = p
+            break
+    if not hit:
+        return {"error": f"unknown program '{program}'", "known": [p.get("program") for p in d.get("programs", [])]}
+    cpp = float(hit["cpp_cents"]) / 100.0
+    value = round(points * cpp, 2)
+    verdict = "points" if value >= cash_price else "cash"
+    return {
+        "program": hit["program"],
+        "points": points,
+        "cpp_cents": hit["cpp_cents"],
+        "points_value_usd": value,
+        "cash_price_usd": cash_price,
+        "verdict": verdict,
+        "savings_usd": round(abs(value - cash_price), 2),
+        "note": "Check bonus_watch() — an active transfer bonus lowers the points needed.",
+    }
+
+
+def _bonus_watch_impl():
+    d = _load_json("transfer_bonuses.json")
+    if "_error" in d:
+        return {"error": f"transfer_bonuses.json unreadable: {d['_error']}"}
+    today = time.strftime("%Y-%m-%d")
+    active, expired = [], []
+    for b in d.get("bonuses", []):
+        (active if not b.get("end_date") or b["end_date"] >= today else expired).append(b)
+    return {
+        "last_checked": d.get("last_checked"),
+        "active": active,
+        "expired_count": len(expired),
+        "note": "Bonuses are time-limited — verify live before transferring.",
+    }
+
+
+def _cheap_hack_impl(origin, dests, dates, flags=None):
+    flags = flags or {}
+    origin = (origin or "").upper().strip()
+    matrix, errors = {}, []
+    for dest in dests or []:
+        for date in dates or []:
+            try:
+                r = _search_impl(origin, dest, date)
+                opts = r.get("options", [])
+                cheapest = min(opts, key=lambda o: o.get("price") or 1e18) if opts else None
+                matrix.setdefault(dest.upper().strip(), {})[date] = cheapest or {"error": r.get("error", "no options")}
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{dest}@{date}: {e}")
+    best = None
+    for dest, by_date in matrix.items():
+        for date, o in by_date.items():
+            if isinstance(o.get("price"), (int, float)) and (best is None or o["price"] < best["price"]):
+                best = {"dest": dest, "date": date, **o}
+    out = {
+        "matrix": matrix,
+        "positioning_hint": (
+            f"Cheapest: {best['dest']} on {best['date']} at ${best['price']} — "
+            "price a positioning flight from home if that's not your airport."
+            if best else "No priced options found."
+        ),
+    }
+    if flags.get("hidden_city"):
+        out["hidden_city"] = {"requested": True, "caveat": "Skiplagging violates most airlines' contract of carriage; can void miles/status and strand checked bags. Use at own risk."}
+    if flags.get("split_ticket"):
+        out["split_ticket"] = {"requested": True, "caveat": "Separate tickets = no misconnect protection; leave 3h+ between legs and re-check bags."}
+    if errors:
+        out["errors"] = errors
+    return out
+
+
 if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
 
     @mcp.tool()
@@ -260,6 +352,21 @@ if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
     def rank(options: list, prefs: dict = None) -> list:
         """Rank flight options by cash vs miles math. prefs: value_per_point_cents, transfer_bonus_pct, max_stops."""
         return _rank_impl(options, prefs or {})
+
+    @mcp.tool()
+    def cpp_value(points: int, program: str, cash_price: float) -> dict:
+        """Point value math: points × program cpp vs cash price. program e.g. 'Chase UR'."""
+        return _cpp_impl(points, program, cash_price)
+
+    @mcp.tool()
+    def bonus_watch() -> dict:
+        """Active transfer bonuses from data/transfer_bonuses.json (refresh weekly)."""
+        return _bonus_watch_impl()
+
+    @mcp.tool()
+    def cheap_hack(origin: str, dests: list, dates: list, flags: dict = None) -> dict:
+        """Nearby-airport/date matrix via search_flights. flags: hidden_city, split_ticket (caveats only)."""
+        return _cheap_hack_impl(origin, dests, dates, flags or {})
 
 
 if __name__ == "__main__" and mcp:
