@@ -12,6 +12,7 @@ Tools:
   price_watch(origin, dest, date, target_price)
   card_pick(spend_profile)
   award_search(route, date)  # gated: needs SEATS_AERO_API_KEY
+  fetch_bonus(program=None, refresh=False)  # webfetch: bonus pages ONLY, never fares
 
 Primary: faster-flights (live Google Flights scrape, $0, no key).
 Fallback: SerpAPI Google Flights (optional SERPAPI_KEY, 250 free/mo).
@@ -46,10 +47,10 @@ def _cache_key(name: str, payload: dict) -> Path:
     return CACHE_DIR / f"{name}-{h}.json"
 
 
-def _cache_get(p: Path):
+def _cache_get(p, ttl=CACHE_TTL):
     try:
         d = json.loads(p.read_text())
-        if time.time() - d.get("_ts", 0) < CACHE_TTL:
+        if time.time() - d.get("_ts", 0) < ttl:
             return d["data"]
     except Exception:
         pass
@@ -518,6 +519,23 @@ def _rank_compare_impl(origin, dest, date, cabin="economy", adults=1):
     res = {"primary_source": primary.get("source"), "cheapest_primary": pc,
            "cheapest_secondary": sc, "secondary_count": len(so),
            "disputed": disputed, "reasons": reasons, "note": note}
+    if disputed and pc:  # attach live bonus math so the reply can price the dispute in points
+        try:
+            fb = _fetch_bonus_impl()
+            act = [b for b in fb.get("bonuses", []) if isinstance(b.get("bonus_pct"), (int, float))]
+            if act:
+                top = max(act, key=lambda b: b["bonus_pct"])
+                base_pts = round(pc["price"] / 0.013)
+                eff_pts = round(base_pts / (1 + top["bonus_pct"] / 100))
+                res["bonus_hint"] = {
+                    "text": (f"{top['program']}→{top['partner']} +{top['bonus_pct']}% active, "
+                             f"effective points price drops to ~{eff_pts:,} pts "
+                             f"(vs ~{base_pts:,} at 1.3¢)"),
+                    "via": fb.get("answered_by"),
+                    "caveat": "assumes 1.3¢ point value and award availability — verify before transferring",
+                }
+        except Exception:
+            pass
     _cache_put(key, res)
     return res
 
@@ -871,6 +889,164 @@ def _normalize_awards(raw, route, date):
     return out
 
 
+# PROJECT CONSTRAINT — webfetch scope: fetch_bonus reads ONLY static bonus/promo
+# pages (the three lists below). NEVER webfetch for fares: fares come ONLY from
+# the faster-flights scrape, the Skiplagged MCP, or SerpAPI. Scraped fare pages
+# are volatile and mislead; bonus lists are slow-moving editorial content.
+BONUS_SOURCES = [
+    "https://www.going.com/guides/credit-card-transfer-bonuses",
+    "https://roame.travel/guides/points-transfer-bonuses",
+    "https://www.pointstothet.com/transfer-bonuses",
+]
+BONUS_TTL = 86400  # 24h — bonus lists move slowly; Jina keyless is 20 RPM, stay far under it
+
+_BANK_ALIASES = {
+    "membership rewards": "Amex MR", "amex": "Amex MR",
+    "ultimate rewards": "Chase UR", "chase": "Chase UR",
+    "capital one": "CapOne", "citi thankyou": "Citi", "thankyou": "Citi",
+    "thank you": "Citi", "citi": "Citi", "bilt": "Bilt",
+}
+_MONTHS = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+           "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+           "december": 12, "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6,
+           "jul": 7, "aug": 8, "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def _strip_html(html):
+    from html.parser import HTMLParser
+
+    class _T(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.parts = []
+
+        def handle_data(self, d):
+            self.parts.append(d)
+
+    t = _T()
+    t.feed(html or "")
+    return " ".join(" ".join(t.parts).split())
+
+
+def _searxng_read(url):
+    """Self-host SearXNG reader (SEARXNG_URL, default localhost:8080). Raises on failure."""
+    base = os.environ.get("SEARXNG_URL", "http://localhost:8080").rstrip("/")
+    q = urllib.parse.quote(url, safe="")
+    for u in (f"{base}/read?url={q}", f"{base}/search?format=json&q={q}"):
+        r = httpx.get(u, timeout=20, headers={"Accept": "application/json, text/html, text/plain"})
+        r.raise_for_status()
+        if "json" in r.headers.get("content-type", ""):
+            d = r.json()
+            res = d.get("results", d if isinstance(d, list) else [])
+            host = url.split("/")[2]
+            for e in res if isinstance(res, list) else []:
+                if isinstance(e, dict) and host in str(e.get("url", "")) and e.get("content"):
+                    return e["content"], "searxng"
+        elif len(r.text) > 500:
+            t = r.text
+            return (_strip_html(t) if "<html" in t[:500].lower() else t), "searxng"
+    raise RuntimeError("searxng: no readable result")
+
+
+def _jina_read(url):
+    """Jina Reader keyless (20 RPM free). Raises on failure."""
+    r = httpx.get("https://r.jina.ai/" + url, timeout=30, headers={"Accept": "text/plain"})
+    r.raise_for_status()
+    if len(r.text) < 500:
+        raise RuntimeError(f"jina: suspiciously short ({len(r.text)} chars)")
+    return r.text, "jina"
+
+
+def _parse_bonus_rows(text):
+    """'Transfer <Bank> to <Partner> with a NN% bonus [through <date>]' → rows."""
+    import re
+    banks = "|".join(sorted(_BANK_ALIASES, key=len, reverse=True))
+    rows = []
+    pat = re.compile(
+        r"(" + banks + r")\b.{0,80}?\bto\b\s+"
+        r"([A-Z][A-Za-z.&'\-]*(?:\s+[A-Za-z.&'\-]+){0,5})"
+        r"\s*(?:[:\u2013\u2014-]\s*)?(?:with\s+an?\s+)?(\d{1,3})\s*%\s*(?:transfer\s+)?bonus", re.I | re.S)
+    months = "|".join(sorted(_MONTHS, key=len, reverse=True))
+    dpat = re.compile(
+        r"(?:through|until|till|ends?|expir\w*|valid\s+(?:through|until))\b[^.\n]{0,50}?"
+        r"(" + months + r")\s+(\d{1,2})(?:\D{0,10}?(\d{4}))?", re.I)
+    seen = set()
+    for m in pat.finditer(text or ""):
+        pct = int(m.group(3))
+        if not 5 <= pct <= 100:
+            continue
+        bank = _BANK_ALIASES[m.group(1).lower()]
+        partner = re.sub(r"\s+", " ", m.group(2)).strip(" .,-")
+        _prev = None
+        while _prev != partner:  # strip filler words the greedy match swallowed
+            _prev = partner
+            partner = re.sub(r"\s+(for|with|and|plus|an?|to|of|a)$", "", partner, flags=re.I).strip()
+        dm = dpat.search(text[m.end():m.end() + 200])
+        end_date = None
+        if dm:
+            y = int(dm.group(3)) if dm.group(3) else time.localtime().tm_year
+            end_date = f"{y}-{_MONTHS[dm.group(1).lower()]:02d}-{int(dm.group(2)):02d}"
+        k = (bank.lower(), partner.lower())
+        if k in seen or len(partner) < 3:
+            continue
+        seen.add(k)
+        rows.append({"program": bank, "partner": partner, "bonus_pct": pct, "end_date": end_date})
+    return rows
+
+
+def _fetch_bonus_impl(program=None, refresh=False):
+    """Live bonus lists (SearXNG → Jina → static). Never raises — degrades to static file."""
+    tried, parsed = [], []
+    ckey = _cache_key("fetch_bonus", {"program": program or "ALL"})
+    if not refresh:
+        hit = _cache_get(ckey, BONUS_TTL)
+        if hit is not None:
+            return {**hit, "cached": True}
+    answered_by = None
+    for url in BONUS_SOURCES:
+        text, via = None, None
+        for reader in (_searxng_read, _jina_read):
+            try:
+                text, via = reader(url)
+                break
+            except Exception as e:  # noqa: BLE001
+                tried.append(f"{reader.__name__}:{e}"[:140])
+        if not text:
+            continue
+        rows = _parse_bonus_rows(text)
+        for r in rows:
+            parsed.append({**r, "source": url})
+        tried.append(f"{url} via {via}: {len(rows)} rows")
+        if rows:
+            answered_by = f"{via}:{url.split('/')[2]}"
+            break  # cascade: first source with rows wins (24h cache makes this cheap)
+    static = _bonus_watch_impl()
+    merged, seen = [], set()
+    for b in parsed:
+        k = (str(b.get("program", "")).lower(), str(b.get("partner", "")).lower())
+        if k not in seen:
+            seen.add(k)
+            merged.append(b)
+    for b in static.get("active", []):
+        k = (str(b.get("from", "")).lower(), str(b.get("to", "")).lower())
+        if k not in seen:
+            seen.add(k)
+            merged.append({"program": b.get("from"), "partner": b.get("to"),
+                           "bonus_pct": b.get("pct"), "end_date": b.get("end_date"),
+                           "source": "static:transfer_bonuses.json"})
+    if program:
+        want = program.strip().lower()
+        merged = [b for b in merged
+                  if want in str(b.get("program", "")).lower()
+                  or want in str(b.get("partner", "")).lower()]
+    res = {"bonuses": merged, "answered_by": answered_by or "static-file",
+           "tried": tried, "cached": False,
+           "last_checked": static.get("last_checked"),
+           "note": "Fares never come from webfetch — bonus/promo pages only."}
+    _cache_put(ckey, res)
+    return res
+
+
 if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
 
     @mcp.tool()
@@ -930,6 +1106,11 @@ if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
     def award_search(route: str, date: str) -> dict:
         """Award seats via seats.aero (needs SEATS_AERO_API_KEY; without it returns PointsYeah steps)."""
         return _award_search_impl(route, date)
+
+    @mcp.tool()
+    def fetch_bonus(program: str = None, refresh: bool = False) -> dict:
+        """Live transfer bonuses: SearXNG → Jina (keyless) → static file. Bonus pages only, never fares."""
+        return _fetch_bonus_impl(program, refresh)
 
 
 if __name__ == "__main__" and mcp:
