@@ -11,6 +11,7 @@ Tools:
   delay_risk(carrier, origin, dest, month="ALL")
   price_watch(origin, dest, date, target_price)
   card_pick(spend_profile)
+  award_search(route, date)  # gated: needs SEATS_AERO_API_KEY
 
 Primary: faster-flights (live Google Flights scrape, $0, no key).
 Fallback: SerpAPI Google Flights (optional SERPAPI_KEY, 250 free/mo).
@@ -815,6 +816,61 @@ def _card_pick_impl(spend_profile):
                      "Bonuses change — verify current offers before applying.")}
 
 
+def _award_search_impl(route, date):
+    """seats.aero Cached Search passthrough (gated). No key → message + PointsYeah manual steps."""
+    route = (route or "").upper().strip()
+    if "-" not in route:
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT"}
+    o, d = [p.strip() for p in route.split("-", 1)]
+    key = os.environ.get("SEATS_AERO_API_KEY", "")
+    if not key:
+        return {"route": route, "date": date, "source": "none", "availability": [],
+                "message": "SEATS_AERO_API_KEY absent — award search needs a seats.aero key; nothing broke.",
+                "manual_crosscheck": {
+                    "tool": "PointsYeah.com (free plan shows ±4 days around your date)",
+                    "steps": ["Search your route + date on PointsYeah",
+                              "Note which programs show award seats",
+                              "Check transfer_partners.json: which of your bank points transfer there",
+                              "Call bonus_watch() before transferring — a bonus cuts the points needed",
+                              "Set SEATS_AERO_API_KEY for live award_search results"]}}
+    cache_key = _cache_key("awards", {"route": route, "date": date})
+    hit = _cache_get(cache_key)
+    if hit is not None:
+        return hit
+    try:
+        r = _with_backoff(lambda: httpx.get(
+            "https://api.seats.aero/partnerapi/search",
+            params={"origin_airport": o, "destination_airport": d,
+                    "start_date": date, "end_date": date},
+            headers={"Partner-Authorization": f"Bearer {key}"}, timeout=30))
+        r.raise_for_status()
+        res = {"route": route, "date": date, "source": "seats.aero",
+               "availability": _normalize_awards(r.json(), route, date)}
+        _cache_put(cache_key, res)
+        return res
+    except Exception as e:  # noqa: BLE001 — never break: key present but call failed
+        return {"route": route, "date": date, "source": "seats.aero",
+                "availability": [], "message": f"seats.aero call failed ({e}); try again or use PointsYeah steps"}
+
+
+def _normalize_awards(raw, route, date):
+    """seats.aero response {data:[...]} → uniform award cards."""
+    items = raw.get("data", []) if isinstance(raw, dict) else []
+    out = []
+    for f in items[:15]:
+        if not isinstance(f, dict):
+            continue
+        out.append({
+            "program": f.get("mileage_program") or f.get("source") or "unknown",
+            "cabin": f.get("cabin") or f.get("cabin_class") or "?",
+            "date": f.get("date") or f.get("departure_date") or date,
+            "seats": f.get("remaining_seats", f.get("availability_count", "?")),
+            "route": route,
+            "link": f"https://seats.aero/search?min_seats=1&applicable_cabin=any&additional_days=false&additional_days_roundtrip=false&origin_airport={route.split('-')[0]}&destination_airport={route.split('-')[1]}&date={date}",
+        })
+    return out
+
+
 if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
 
     @mcp.tool()
@@ -869,6 +925,11 @@ if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
     def card_pick(spend_profile: dict = None) -> dict:
         """Top-3 cards by spend match (vendor API cached, offline samples). No affiliate links."""
         return _card_pick_impl(spend_profile or {})
+
+    @mcp.tool()
+    def award_search(route: str, date: str) -> dict:
+        """Award seats via seats.aero (needs SEATS_AERO_API_KEY; without it returns PointsYeah steps)."""
+        return _award_search_impl(route, date)
 
 
 if __name__ == "__main__" and mcp:
