@@ -9,6 +9,8 @@ Tools:
   rank_compare(origin, dest, date)
   price_signal(route, date)
   delay_risk(carrier, origin, dest, month="ALL")
+  price_watch(origin, dest, date, target_price)
+  card_pick(spend_profile)
 
 Primary: faster-flights (live Google Flights scrape, $0, no key).
 Fallback: SerpAPI Google Flights (optional SERPAPI_KEY, 250 free/mo).
@@ -525,6 +527,9 @@ def _price_history_db():
     con.execute("CREATE TABLE IF NOT EXISTS price_signals"
                 "(route TEXT, date TEXT, lowest_price REAL, fetched_at REAL, cached INTEGER,"
                 " PRIMARY KEY (route, date))")
+    con.execute("CREATE TABLE IF NOT EXISTS price_watches"
+                "(route TEXT, date TEXT, target_price REAL, last_price REAL, last_checked REAL,"
+                " PRIMARY KEY (route, date))")
     return con
 
 
@@ -609,6 +614,207 @@ def _delay_risk_impl(carrier, origin, dest, month="ALL"):
             "note": "Static BTS sample — swap in ontime_full.json for full coverage."}
 
 
+def _price_watch_impl(origin, dest, date, target_price):
+    """Check-on-query fare watch: Skiplagged passthrough (+faster-flights fallback), SQLite trend."""
+    origin, dest = (origin or "").upper().strip(), (dest or "").upper().strip()
+    route = f"{origin}-{dest}"
+    current, source, errors = None, None, []
+    try:
+        r = _skiplagged_search(origin, dest, date)
+        priced = [o["price"] for o in r.get("options", []) if isinstance(o.get("price"), (int, float))]
+        if priced:
+            current, source = min(priced), "skiplagged"
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"skiplagged: {e}")
+    if current is None:
+        try:
+            r = _search_impl(origin, dest, date)
+            priced = [o["price"] for o in r.get("options", []) if isinstance(o.get("price"), (int, float))]
+            if priced:
+                current, source = min(priced), r.get("source")
+        except Exception as e:  # noqa: BLE001
+            errors.append(f"scraper: {e}")
+    con = _price_history_db()
+    prev = con.execute("SELECT last_price FROM price_watches WHERE route=? AND date=?",
+                       (route, date)).fetchone()
+    if current is not None:
+        con.execute("INSERT OR REPLACE INTO price_watches VALUES (?,?,?,?,?)",
+                    (route, date, float(target_price), float(current), time.time()))
+        con.commit()
+    con.close()
+    if current is None:
+        return {"route": route, "date": date, "target_price": target_price,
+                "current_price": None, "below_target": False, "trend": None,
+                "message": f"no live prices ({'; '.join(errors)[:200]})"}
+    trend = None
+    if prev and prev[0] != current:
+        trend = f"moved ${prev[0]} → ${current} since last check"
+    return {"route": route, "date": date, "target_price": target_price,
+            "current_price": current, "source": source,
+            "below_target": current <= target_price,
+            "savings_usd": round(target_price - current, 2), "trend": trend,
+            "message": None if current <= target_price else
+            f"${current} is above your ${target_price} target — watch continues on next query (no daemon)."}
+
+
+_SAMPLE_CARDS = [
+    {"name": "Chase Sapphire Preferred", "issuer": "Chase", "currency": "CHASE", "annual_fee": 95,
+     "rewards": {"dining": 3, "travel": 3, "groceries": 1, "other": 1},
+     "bonus": "60k UR after $4k/3mo", "notes": "sample — refresh via card_pick live fetch"},
+    {"name": "Amex Gold", "issuer": "Amex", "currency": "AMERICAN_EXPRESS", "annual_fee": 325,
+     "rewards": {"dining": 4, "groceries": 4, "travel": 3, "other": 1},
+     "bonus": "60k MR after $6k/6mo", "notes": "sample — refresh via card_pick live fetch"},
+    {"name": "Capital One Venture X", "issuer": "CapOne", "currency": "CAPITAL_ONE", "annual_fee": 395,
+     "rewards": {"travel": 5, "other": 2, "dining": 2, "groceries": 2},
+     "bonus": "75k miles after $4k/3mo", "notes": "sample — refresh via card_pick live fetch"},
+]
+
+
+def _fetch_cards():
+    """Vendor credit-card-bonuses-api JSON (raw first, GitHub discovery fallback, else samples)."""
+    cache_paths = [DATA_DIR / "cards_cache.json", CACHE_DIR / "cards_cache.json"]
+    for cp in cache_paths:
+        try:
+            d = json.loads(cp.read_text())
+            if isinstance(d.get("cards"), list) and d["cards"]:
+                return d["cards"], f"cache:{cp.name}"
+        except Exception:
+            continue
+    cards, origin = None, "samples"
+    raw_candidates = [
+        "https://raw.githubusercontent.com/andenacitelli/credit-card-bonuses-api/main/exports/data.json",
+        "https://raw.githubusercontent.com/andenacitelli/credit-card-bonuses-api/master/exports/data.json",
+    ]
+    for url in raw_candidates:
+        try:
+            r = httpx.get(url, timeout=20)
+            r.raise_for_status()
+            d = r.json()
+            lst = d if isinstance(d, list) else d.get("cards", d.get("data"))
+            if isinstance(lst, list) and lst:
+                cards, origin = lst, "vendor:andenacitelli/credit-card-bonuses-api"
+                break
+        except Exception:
+            continue
+    if cards is None:
+        try:
+            idx = _with_backoff(lambda: httpx.get(
+                "https://api.github.com/repos/andenacitelli/credit-card-bonuses-api/contents/exports",
+                timeout=20, headers={"Accept": "application/vnd.github+json"}))
+            idx.raise_for_status()
+            blobs = [e.get("download_url") for e in idx.json()
+                     if isinstance(e, dict) and (e.get("name", "").endswith(".json"))]
+            for url in blobs[:3]:
+                try:
+                    r = httpx.get(url, timeout=20)
+                    r.raise_for_status()
+                    d = r.json()
+                    lst = d if isinstance(d, list) else d.get("cards", d.get("data"))
+                    if isinstance(lst, list) and lst:
+                        cards, origin = lst, "vendor:andenacitelli/credit-card-bonuses-api"
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+    if cards is None:
+        return list(_SAMPLE_CARDS), "samples:offline-fallback"
+    try:
+        payload = {"last_fetched": time.strftime("%Y-%m-%d"), "cards": cards[:500]}
+        for cp in cache_paths:
+            try:
+                cp.write_text(json.dumps(payload))
+                origin += f"+cached:{cp.name}"
+                break
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return cards, origin
+
+
+_ISSUERS = {"CHASE": "Chase", "AMERICAN_EXPRESS": "Amex", "CAPITAL_ONE": "CapOne",
+             "CITI": "Citi", "WELLS_FARGO": "Wells", "BANK_OF_AMERICA": "BofA"}
+_TRANSFERABLE = {"CHASE", "AMERICAN_EXPRESS", "CAPITAL_ONE", "CITI", "WELLS_FARGO", "US_BANK"}
+
+
+def _issuer_cpp(issuer):
+    try:
+        d = _load_json("cpp.json")
+        for p in d.get("programs", []):
+            names = [p.get("program", "")] + p.get("aliases", [])
+            if any((issuer or "").lower() in str(n).lower() or str(n).lower() in (issuer or "").lower()
+                   for n in names if n):
+                return float(p["cpp_cents"]) / 100.0
+    except Exception:
+        pass
+    return 0.01
+
+
+def _score_cards(cards, profile):
+    """Annual rewards value (points × issuer cpp) minus annual fee. No affiliate links."""
+    scored = []
+    for c in cards:
+        if not isinstance(c, dict) or c.get("discontinued"):
+            continue
+        if str(c.get("currency", "")).upper() not in _TRANSFERABLE:
+            continue  # co-brand currency: vendor flat rate isn't all-spend — skip, say so in note
+        name = c.get("name") or c.get("cardName") or "unknown card"
+        issuer = c.get("issuer") or c.get("bank") or ""
+        issuer = _ISSUERS.get(str(issuer).upper(), issuer)
+        if not issuer:
+            for k in ("chase", "amex", "capital one", "capone", "citi", "bilt", "wells"):
+                if k in name.lower():
+                    issuer = k
+                    break
+        rw = c.get("rewards") or c.get("categories") or c.get("earn") or {}
+        mults, basis = {}, None
+        if isinstance(rw, dict) and rw:
+            mults = {str(k).lower(): (v if isinstance(v, (int, float)) else 1) for k, v in rw.items()}
+        elif isinstance(rw, list):
+            for e in rw:
+                if isinstance(e, dict):
+                    cat = str(e.get("category") or e.get("type") or "other").lower()
+                    mults[cat] = e.get("multiplier", e.get("rate", e.get("points", 1)))
+        flat = min(c.get("universalCashbackPercent", 1) or 1, 2.5)  # cap: no all-spend card pays more
+        if not mults:
+            basis = f"flat {flat}% (vendor has no per-category rates; capped — high vendor rates are category-specific)"
+        cpp = _issuer_cpp(issuer or name)
+        pts = sum(float(profile.get(cat, 0)) * 12 * float(mults.get(cat, mults.get("other", flat)))
+                  for cat in profile)
+        try:
+            fee = float(c.get("annual_fee", c.get("annualFee", c.get("fee", 0))) or 0)
+        except Exception:
+            fee = 0
+        bonus = c.get("bonus") or c.get("signupBonus") or c.get("welcome_offer")
+        if not bonus and isinstance(c.get("offers"), list) and c["offers"]:
+            o = c["offers"][0]
+            amt = o.get("amount")
+            amt = amt[0].get("amount") if isinstance(amt, list) and amt else amt
+            bonus = f"{amt} pts after ${o.get('spend')}/{o.get('days')}d" if amt else None
+        item = {"name": name, "issuer": issuer or "unknown",
+                "annual_rewards_usd": round(pts * cpp, 2),
+                "annual_fee": fee, "net_usd": round(pts * cpp - fee, 2), "bonus": bonus}
+        if basis:
+            item["rewards_basis"] = basis
+        scored.append(item)
+    scored.sort(key=lambda s: s["net_usd"], reverse=True)
+    return scored
+
+
+def _card_pick_impl(spend_profile):
+    profile = {str(k).lower(): float(v) for k, v in (spend_profile or {}).items()}
+    if not profile or sum(profile.values()) <= 0:
+        return {"error": "spend_profile needed, e.g. {dining: 500, travel: 800, groceries: 600, other: 1500} (monthly $)"}
+    cards, origin = _fetch_cards()
+    top = _score_cards(cards, profile)[:3]
+    return {"spend_profile_monthly": spend_profile, "cards_considered": len(cards),
+            "source": origin, "top_3": top,
+            "note": ("Static math, no affiliate links. Transferable currencies only "
+                     "(co-brand skipped: vendor flat rate isn't all-spend). "
+                     "Bonuses change — verify current offers before applying.")}
+
+
 if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
 
     @mcp.tool()
@@ -653,6 +859,16 @@ if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
     def delay_risk(carrier: str, origin: str, dest: str, month: str = "ALL") -> dict:
         """Misconnect probability from static BTS table (route e.g. JFK-LAX, month 1-12 or ALL)."""
         return _delay_risk_impl(carrier, origin, dest, month)
+
+    @mcp.tool()
+    def price_watch(origin: str, dest: str, date: str, target_price: float) -> dict:
+        """Check-on-query fare watch (Skiplagged + fallback, SQLite trend). No daemon."""
+        return _price_watch_impl(origin, dest, date, target_price)
+
+    @mcp.tool()
+    def card_pick(spend_profile: dict = None) -> dict:
+        """Top-3 cards by spend match (vendor API cached, offline samples). No affiliate links."""
+        return _card_pick_impl(spend_profile or {})
 
 
 if __name__ == "__main__" and mcp:
