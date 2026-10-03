@@ -28,6 +28,12 @@ Rank flights by price/timing + miles transfer value. Free data only.
 - `data/transfer_bonuses.json` — bonuses expire. Refresh weekly: check Roame → update rows `{from,to,pct,end_date,source}`, drop expired, bump `last_checked`. Stale bonuses cost real points.
 - `data/cpp.json` — TPG-style valuations drift. Re-check against current TPG valuations monthly-ish, bump `last_verified`.
 
+## Accuracy trio (trust, but verify)
+
+- `rank_compare(origin, dest, date)` — cross-checks faster-flights vs Skiplagged MCP in parallel. `disputed: true` (price diff >10% or depart times >60min apart on the same airline) means don't trust either number — run `price_signal(route, date, disputed=true)` for a fresh SerpAPI pull. Skiplagged down → single-source + note, still usable.
+- `price_signal(route, date)` — SerpAPI `price_insights`, cached read first (free), fresh pull only on miss/dispute. History lands in SQLite (`/tmp/flight-rank/history.db`). No `SERPAPI_KEY` → skips gracefully, say so.
+- `delay_risk(carrier, origin, dest, month)` — BTS-sample misconnect probability. For tight connections add `rank` prefs `{"apply_delay_penalty": true, "origin": ..., "dest": ..., "month": ...}` — score gains `misconnect_prob × $150` (tune via `delay_dollars`). Sample covers JFK-LAX + SFO-ORD corridors only; anything else falls back to route/global average and says so (`match` field).
+
 ## Limits
 
 - No live miles API exists; transfer ratios are static (`data/transfer_partners.json`).
