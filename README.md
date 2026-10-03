@@ -1,6 +1,8 @@
 # flight-rank
 Free flight-deals ranker: live prices via free APIs + MCP, miles/credit-card transfer math, ranked best options. Agent-first (OpenCode skill + local MCP).
 
+**Version: v0.5.0** (see [CHANGELOG.md](CHANGELOG.md)). Zero keys required for everything except the three optional legs: SerpAPI fallback (`SERPAPI_KEY`), award search (`SEATS_AERO_API_KEY`).
+
 `git clone + ./install.sh` wires a `flight-rank` MCP + skill into OpenCode on any Linux/Mac. No paid keys required.
 
 ## Free stack (and limits)
@@ -14,6 +16,7 @@ Free flight-deals ranker: live prices via free APIs + MCP, miles/credit-card tra
   - `data/cpp.json` (TPG-style cents-per-point: Bilt 2.2, Chase UR 2.05, Amex MR 2.0, Citi 1.9, CapOne 1.85, Hyatt 1.55, Marriott 0.8, Hilton 0.35 — illustrative snapshot, re-verify against current TPG valuations)
   - `data/ontime_sample.json` (BTS-style delay/cancel sample for JFK-LAX + SFO-ORD corridors; `ontime_full.json` drop-in for full BTS coverage)
 - **Cards:** live vendor JSON ([andenacitelli/credit-card-bonuses-api](https://github.com/andenacitelli/credit-card-bonuses-api), 175 cards, cached to `data/cards_cache.json`) with 3-card offline fallback; transferable currencies only, vendor flat rates capped at 2.5%. Static math, no affiliate links.
+- **Award search (gated):** [seats.aero](https://seats.aero) Cached Search via optional `SEATS_AERO_API_KEY` (baeleb/seats-MCP pattern). Without the key: PointsYeah free manual steps, never an error.
 - **Not used:** Amadeus (free tier shut 2026-07-17 — every Amadeus MCP is a dead backend).
 
 ## Install
@@ -48,12 +51,14 @@ More examples:
 - `delay_risk("AA", "JFK", "LAX", "7")` — misconnect probability; feed into `rank` via `{"apply_delay_penalty": true, ...}` to penalize tight connections.
 - `price_watch("JFK", "LAX", "2026-11-20", 250)` — check-on-query fare watch (Skiplagged + SQLite trend). No daemon, no key.
 - `card_pick({"dining": 500, "travel": 800, "groceries": 600, "other": 1500})` — top-3 cards by spend match from the FOSS card-bonuses API (cached to `data/cards_cache.json`, 3-card offline fallback). Static math, no affiliate links.
+- `award_search("ICN-NRT", "2026-11-20")` — live award seats via seats.aero (**optional** `SEATS_AERO_API_KEY`; without it returns PointsYeah free manual steps, never an error).
 
 ## Weekly refresh
 
+- Automated skeleton: `.github/workflows/refresh-data.yml` (Mondays 09:00 UTC + manual dispatch, no secrets) re-fetches the cards vendor JSON and prints the human checklist. It pushes nothing — review the diff, merge by hand.
 - `data/transfer_bonuses.json` — bonuses expire fast. Check Roame/AwardTravelFinder/Going weekly: update `{from,to,pct,end_date,source}`, drop expired, bump `last_checked`.
 - `data/cpp.json` — re-check against current TPG valuations when they move, bump `last_verified`.
-- `data/ontime_sample.json` → `ontime_full.json` (monthly refresh plan, no Action file yet):
+- `data/ontime_sample.json` → `ontime_full.json` (monthly refresh plan — extend the Action above):
   1. Monthly cron/white (GitHub Action): download the BTS Airline On-Time Performance PREZIP for the latest month.
   2. Aggregate by carrier + origin + dest + month: flight count, avg delay minutes, cancel share, misconnect proxy.
   3. Write `data/ontime_full.json` (same row shape as the sample), bump `last_verified`, open a PR.
