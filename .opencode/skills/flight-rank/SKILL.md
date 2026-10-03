@@ -43,6 +43,12 @@ Rank flights by price/timing + miles transfer value. Free data only.
 
 - `award_search(route, date)` — live award seats via seats.aero, only with `SEATS_AERO_API_KEY` set. Without the key it returns PointsYeah free 4-day manual steps instead of erroring: send the user those steps (search PointsYeah → match programs → check `transfer_partners.json` → `bonus_watch()` before transferring). Zero-key default stays intact.
 
+## Live bonus fetch (webfetch: bonus pages only, never fares)
+
+- `fetch_bonus(program=None, refresh=False)` — fresh transfer bonuses, zero-key cascade: self-host SearXNG (`SEARXNG_URL`, default `http://localhost:8080`) → Jina Reader keyless (default, 20 RPM — cached 24h so we never get near it) → static `transfer_bonuses.json`. Returns `{program, partner, bonus_pct, end_date}` + `answered_by`. Never raises.
+- `rank_compare` auto-attaches `bonus_hint` when disputed (`Amex→BA +30% active, effective points price drops to ~X pts`) — quote it in the reply.
+- Hard rule: webfetch touches bonus/promo lists ONLY. Fares always come from faster-flights / Skiplagged MCP / SerpAPI — scraped fare pages mislead.
+
 ## Limits
 
 - No live miles API exists; transfer ratios are static (`data/transfer_partners.json`).
