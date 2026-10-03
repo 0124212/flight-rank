@@ -6,6 +6,9 @@ Tools:
   cpp_value(points, program, cash_price)
   bonus_watch()
   cheap_hack(origin, dests, dates, flags={})
+  rank_compare(origin, dest, date)
+  price_signal(route, date)
+  delay_risk(carrier, origin, dest, month="ALL")
 
 Primary: faster-flights (live Google Flights scrape, $0, no key).
 Fallback: SerpAPI Google Flights (optional SERPAPI_KEY, 250 free/mo).
@@ -222,6 +225,9 @@ def _rank_impl(options, prefs=None):
     cpp = float((prefs.get("value_per_point_cents") or 1.3)) / 100.0  # $/pt
     bonus = float(prefs.get("transfer_bonus_pct") or 0) / 100.0
     max_stops = prefs.get("max_stops")
+    apply_delay = prefs.get("apply_delay_penalty")
+    delay_dollars = float(prefs.get("delay_dollars", 150))
+    delay_month = prefs.get("month")
     ranked = []
     for o in options:
         cash = o.get("price")
@@ -244,7 +250,18 @@ def _rank_impl(options, prefs=None):
         score = (effective or 1e9) + penalty
         if max_stops is not None and isinstance(stops, int) and stops > max_stops:
             continue
-        ranked.append({**o, "effective_cash": effective, "via": via, "score": round(score, 2)})
+        delay = None
+        if apply_delay:
+            carrier = (o.get("airline") or "unknown").split("+")[0]
+            delay = _delay_lookup(
+                carrier, o.get("origin") or prefs.get("origin"),
+                o.get("dest") or prefs.get("dest"), delay_month,
+            )
+            score += delay["misconnect_prob"] * delay_dollars
+        item = {**o, "effective_cash": effective, "via": via, "score": round(score, 2)}
+        if delay:
+            item["delay"] = delay
+        ranked.append(item)
     ranked.sort(key=lambda r: r["score"])
     return ranked
 
@@ -338,6 +355,260 @@ def _cheap_hack_impl(origin, dests, dates, flags=None):
     return out
 
 
+def _skiplagged_search(origin, dest, date):
+    """Skiplagged public MCP (streamable HTTP) → option cards. Raises on any failure."""
+    url = "https://mcp.skiplagged.com/mcp"
+    headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
+    with httpx.Client(timeout=30) as c:
+        init = c.post(url, headers=headers, json={
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                       "clientInfo": {"name": "flight-rank", "version": "1.0"}},
+        })
+        init.raise_for_status()
+        sid = init.headers.get("mcp-session-id", "")
+        if sid:
+            headers["mcp-session-id"] = sid
+        try:
+            c.post(url, headers=headers, json={"jsonrpc": "2.0", "method": "notifications/initialized"})
+        except Exception:
+            pass
+        call = c.post(url, headers=headers, json={
+            "jsonrpc": "2.0", "id": 2, "method": "tools/call",
+            "params": {"name": "sk_flights_search",
+                       "arguments": {"origin": origin, "destination": dest,
+                                     "date": date, "departureDate": date,
+                                     "departure_date": date, "includeHiddenCity": True}},
+        })
+        call.raise_for_status()
+    payload = None
+    for line in call.text.splitlines():
+        if line.startswith("data:"):
+            try:
+                payload = json.loads(line[5:].strip())  # last complete data event wins
+            except Exception:
+                continue
+    if payload is None:
+        try:
+            payload = call.json()
+        except Exception:
+            raise RuntimeError(f"skiplagged: non-JSON response ({call.text[:120]})")
+    result = (payload or {}).get("result", payload or {})
+    if result.get("isError"):
+        texts = [b.get("text", "") for b in result.get("content", []) if isinstance(b, dict)]
+        raise RuntimeError(f"skiplagged: {'; '.join(texts)[:200]}")
+    texts = [b.get("text", "") for b in result.get("content", []) if isinstance(b, dict)]
+    raw = None
+    for t in texts:
+        try:
+            raw = json.loads(t)
+            break
+        except Exception:
+            continue
+    if raw is not None:
+        opts = _normalize(raw, origin, dest, date)
+    else:  # markdown table (Skiplagged's usual shape) → parse directly
+        opts = []
+        for t in texts:
+            opts.extend(_parse_skiplagged_md(t, origin, dest, date))
+            if opts:
+                break
+    if not opts:
+        raise RuntimeError(f"skiplagged: 0 priced options ({call.text[:120]})")
+    return {"source": "skiplagged", "options": opts}
+
+
+def _parse_skiplagged_md(text, origin, dest, date):
+    """Parse Skiplagged MCP markdown table → option cards (incl. hidden-city flag)."""
+    import re
+    out, link = [], _deep_link(origin, dest, date)
+    for line in (text or "").splitlines():
+        m = re.match(r"^\|\s*\$([\d,]+)\s*\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|", line)
+        if not m:
+            continue
+        price = float(m.group(1).replace(",", ""))
+        dur, stops_s, typ, airline, segs, book = (g.strip() for g in m.groups()[1:])
+        stops = 0 if stops_s.lower().startswith("nonstop") else (
+            int(re.search(r"\d+", stops_s).group()) if re.search(r"\d+", stops_s) else "?")
+        times = re.findall(r"\d{4}-\d{2}-\d{2} (\d{2}:\d{2})", segs) or re.findall(
+            r"(?<![:\d])(\d{2}:\d{2})(?::\d{2})?(?![\d:])", segs)
+        bl = re.search(r"\[Book\]\(([^)]+)\)", book)
+        out.append({
+            "price": price, "airline": airline or "unknown", "stops": stops,
+            "duration": dur or "?", "depart": times[0] if times else "?",
+            "arrive": times[-1] if times else "?",
+            "link": bl.group(1) if bl else link,
+            "skiplagging": typ.lower().startswith("skiplag"),
+        })
+    return [o for o in out if o.get("price")]
+
+
+def _hhmm(s):
+    """'08:00' or '8:00 AM' → minutes. None if unparseable (skip time check)."""
+    import re
+    if not isinstance(s, str):
+        return None
+    m = re.match(r"\s*(\d{1,2}):(\d{2})\s*([AaPp])?\.?\s*[Mm]?\.?\s*$", s)
+    if not m:
+        return None
+    h, mi, ap = int(m.group(1)), int(m.group(2)), (m.group(3) or "").upper()
+    if ap == "P" and h < 12:
+        h += 12
+    if ap == "A" and h == 12:
+        h = 0
+    return h * 60 + mi
+
+
+def _rank_compare_impl(origin, dest, date, cabin="economy", adults=1):
+    from concurrent.futures import ThreadPoolExecutor
+    origin, dest = origin.upper().strip(), dest.upper().strip()
+    key = _cache_key("compare", {"origin": origin, "dest": dest, "date": date,
+                                 "cabin": cabin, "adults": adults})
+    hit = _cache_get(key)
+    if hit is not None:
+        return hit
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f1 = ex.submit(_search_impl, origin, dest, date, cabin, adults)
+        f2 = ex.submit(_skiplagged_search, origin, dest, date)
+        try:
+            primary = f1.result()
+        except Exception as e:  # noqa: BLE001
+            primary = {"source": "none", "options": [], "error": str(e)}
+        secondary, serr = None, None
+        try:
+            secondary = f2.result()
+        except Exception as e:  # noqa: BLE001
+            serr = str(e)
+
+    def cheapest(opts):
+        priced = [o for o in opts if isinstance(o.get("price"), (int, float))]
+        return min(priced, key=lambda o: o["price"]) if priced else None
+
+    po = (primary or {}).get("options", [])
+    so = (secondary or {}).get("options", []) if secondary else []
+    pc, sc = cheapest(po), cheapest(so)
+    disputed, reasons = False, []
+    if sc is None:
+        note = f"skiplagged unreachable ({serr}); single-source via {primary.get('source')}"
+    else:
+        note = f"compared {len(po)} faster-flights vs {len(so)} skiplagged options"
+        if pc and sc and abs(pc["price"] - sc["price"]) / max(pc["price"], 1) > 0.10:
+            disputed = True
+            reasons.append(f"price diff >10%: faster-flights ${pc['price']} vs skiplagged ${sc['price']}")
+        # time mismatch: same airline's cheapest offer departs >60min apart across sources
+        def cheapest_depart(opts):
+            best = {}
+            for o in opts:
+                t = _hhmm(o.get("depart"))
+                if t is None or not isinstance(o.get("price"), (int, float)):
+                    continue
+                for a in str(o.get("airline", "")).split("+"):
+                    if a not in best or o["price"] < best[a][0]:
+                        best[a] = (o["price"], t)
+            return best
+        pa, sa = cheapest_depart(po), cheapest_depart(so)
+        for a, (_, t1) in pa.items():
+            if a in sa and abs(t1 - sa[a][1]) > 60:
+                disputed = True
+                reasons.append(f"time mismatch on {a or 'unknown carrier'}: cheapest departs differ >60min")
+                break
+    res = {"primary_source": primary.get("source"), "cheapest_primary": pc,
+           "cheapest_secondary": sc, "secondary_count": len(so),
+           "disputed": disputed, "reasons": reasons, "note": note}
+    _cache_put(key, res)
+    return res
+
+
+def _price_history_db():
+    import sqlite3
+    con = sqlite3.connect(CACHE_DIR / "history.db")
+    con.execute("CREATE TABLE IF NOT EXISTS price_signals"
+                "(route TEXT, date TEXT, lowest_price REAL, fetched_at REAL, cached INTEGER,"
+                " PRIMARY KEY (route, date))")
+    return con
+
+
+def _price_signal_impl(route, date, disputed=False):
+    route = (route or "").upper().strip()
+    if "-" not in route:
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT"}
+    o, d = [p.strip() for p in route.split("-", 1)]
+    key = os.environ.get("SERPAPI_KEY", "")
+    if not key:
+        return {"route": route, "date": date, "signal": "none",
+                "message": "SERPAPI_KEY absent — price_signal needs SerpAPI; skipping gracefully."}
+    def serp(fresh):
+        params = {"engine": "google_flights", "departure_id": o, "arrival_id": d,
+                  "outbound_date": date, "api_key": key,
+                  "no_cache": "true" if fresh else "false"}
+        r = _with_backoff(lambda: httpx.get("https://serpapi.com/search.json", params=params, timeout=30))
+        r.raise_for_status()
+        return r.json()
+    data = serp(False)
+    insights, cached = data.get("price_insights") or {}, True
+    if not insights or disputed:  # miss or disputed → one fresh pull (costs a credit)
+        data = serp(True)
+        insights, cached = data.get("price_insights") or {}, False
+    lowest = insights.get("lowest_price")
+    con = _price_history_db()
+    prev = con.execute("SELECT lowest_price FROM price_signals WHERE route=? AND date=?",
+                       (route, date)).fetchone()
+    if lowest is not None:
+        try:
+            con.execute("INSERT OR REPLACE INTO price_signals VALUES (?,?,?,?,?)",
+                        (route, date, float(lowest), time.time(), int(cached)))
+            con.commit()
+        except Exception:
+            pass
+    con.close()
+    trend = None
+    if lowest is not None and prev and prev[0] != lowest:
+        trend = f"moved ${prev[0]} → ${lowest} since last check"
+    return {"route": route, "date": date, "lowest_price": lowest,
+            "price_level": insights.get("price_level"),
+            "typical_range": [insights.get("typical_price_range", [None, None])],
+            "cached": cached, "stored": lowest is not None, "trend": trend,
+            "message": None if lowest is not None else "no price_insights in SerpAPI response"}
+
+
+def _load_bts():
+    full = DATA_DIR / "ontime_full.json"  # BTS PREZIP drop-in (same shape, more rows)
+    if full.exists():
+        try:
+            return json.loads(full.read_text())
+        except Exception:
+            pass
+    return _load_json("ontime_sample.json")
+
+
+def _delay_lookup(carrier, origin, dest, month=None):
+    t = _load_bts()
+    rows = t.get("routes", []) if isinstance(t, dict) and "_error" not in t else []
+    want_c = (carrier or "").upper().strip()
+    o, d = (origin or "").upper().strip(), (dest or "").upper().strip()
+    m = str(month or "ALL").upper()
+    glob = {"misconnect_prob": 0.03, "avg_delay_min": 15.0, "cancel_pct": 1.0, "match": "global"}
+    route_rows = [r for r in rows if r.get("origin") == o and r.get("dest") == d]
+    for r in route_rows:
+        if r.get("carrier", "").upper() == want_c and str(r.get("month", "ALL")).upper() in (m, "ALL"):
+            return {"misconnect_prob": float(r["misconnect_prob"]),
+                    "avg_delay_min": float(r["avg_delay_min"]),
+                    "cancel_pct": float(r["cancel_pct"]), "match": "exact"}
+    if route_rows:
+        r = route_rows[0]
+        return {"misconnect_prob": float(r["misconnect_prob"]),
+                "avg_delay_min": float(r["avg_delay_min"]),
+                "cancel_pct": float(r["cancel_pct"]), "match": "route"}
+    return glob
+
+
+def _delay_risk_impl(carrier, origin, dest, month="ALL"):
+    d = _delay_lookup(carrier, origin, dest, month)
+    return {"carrier": (carrier or "").upper(), "origin": (origin or "").upper(),
+            "dest": (dest or "").upper(), "month": month, **d,
+            "note": "Static BTS sample — swap in ontime_full.json for full coverage."}
+
+
 if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
 
     @mcp.tool()
@@ -367,6 +638,21 @@ if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
     def cheap_hack(origin: str, dests: list, dates: list, flags: dict = None) -> dict:
         """Nearby-airport/date matrix via search_flights. flags: hidden_city, split_ticket (caveats only)."""
         return _cheap_hack_impl(origin, dests, dates, flags or {})
+
+    @mcp.tool()
+    def rank_compare(origin: str, dest: str, date: str, cabin: str = "economy", adults: int = 1) -> dict:
+        """Cross-check faster-flights vs Skiplagged MCP. disputed=true when price>10% or times mismatch."""
+        return _rank_compare_impl(origin, dest, date, cabin, adults)
+
+    @mcp.tool()
+    def price_signal(route: str, date: str, disputed: bool = False) -> dict:
+        """SerpAPI price_insights (cached first, fresh only on miss/dispute) + SQLite history."""
+        return _price_signal_impl(route, date, disputed)
+
+    @mcp.tool()
+    def delay_risk(carrier: str, origin: str, dest: str, month: str = "ALL") -> dict:
+        """Misconnect probability from static BTS table (route e.g. JFK-LAX, month 1-12 or ALL)."""
+        return _delay_risk_impl(carrier, origin, dest, month)
 
 
 if __name__ == "__main__" and mcp:
