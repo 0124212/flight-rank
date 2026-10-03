@@ -13,7 +13,7 @@ Free flight-deals ranker: live prices via free APIs + MCP, miles/credit-card tra
 ## Install
 
 ```bash
-git clone https://github.com/0124212/flight-rank && cd flight-rank && ./install.sh
+git clone https://github.com/0124212/flight-rank && cd flight-rank && chmod +x install.sh && ./install.sh
 ```
 
 What it does (idempotent): `pip install -r requirements.txt`, merges a `flight-rank` stdio MCP entry into `~/.config/opencode/opencode.json`, copies the skill to `~/.config/opencode/skills/flight-rank/SKILL.md` (+ legacy `skill/` path). `--dry-run` previews without changing anything. Never prints secrets.
