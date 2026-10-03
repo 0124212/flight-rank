@@ -1,0 +1,43 @@
+# Refresh data files (weekly skeleton — manual approve, no secrets)
+#
+# What it does:
+#   1. Re-fetches the credit-card vendor JSON into data/cards_cache.json
+#      (same source card_pick() uses live; keeps repo cache fresh for offline installs).
+#   2. Prints a refresh checklist for the hand-maintained files
+#      (cpp.json, transfer_bonuses.json) into the job summary — a human applies those.
+#   3. Opens no PRs and pushes nothing by itself: inspect the diff, merge by hand.
+#
+# Triggers: every Monday 09:00 UTC + manual `workflow_dispatch` (Run workflow button).
+# Secrets: none. Network: raw.githubusercontent.com only.
+name: refresh-data
+
+"on":
+  schedule:
+    - cron: "0 9 * * 1"
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Re-fetch cards vendor JSON
+        run: |
+          curl -sL --fail --max-time 60 \
+            https://raw.githubusercontent.com/andenacitelli/credit-card-bonuses-api/main/exports/data.json \
+            -o /tmp/cards.json
+          python3 -c "import json; d=json.load(open('/tmp/cards.json')); print('cards:', len(d if isinstance(d,list) else d.get('cards',[])))"
+          cp /tmp/cards.json data/cards_cache.json
+          git status --porcelain -- data/cards_cache.json || true
+
+      - name: Manual refresh checklist
+        run: |
+          {
+            echo "## Weekly data refresh — human steps"
+            echo ""
+            echo "- [ ] \`data/transfer_bonuses.json\`: check Roame / AwardTravelFinder / Going, update \`{from,to,pct,end_date,source}\`, drop expired, bump \`last_checked\`"
+            echo "- [ ] \`data/cpp.json\`: re-check current TPG valuations, bump \`last_verified\`"
+            echo "- [ ] \`data/cards_cache.json\`: review the diff from this run, keep if sane"
+            echo "- [ ] \`data/ontime_sample.json\` → \`ontime_full.json\`: monthly BTS PREZIP plan (see README)"
+          } >> "$GITHUB_STEP_SUMMARY"

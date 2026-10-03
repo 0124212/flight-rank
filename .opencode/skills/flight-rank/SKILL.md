@@ -39,6 +39,10 @@ Rank flights by price/timing + miles transfer value. Free data only.
 - `price_watch(origin, dest, date, target_price)` — check-on-query fare watch (Skiplagged + fallback, SQLite trend in `/tmp/flight-rank/history.db`). No daemon: below-target → "book now", above → state current vs target and re-check next query. Trend (`moved $X → $Y`) only appears after 2+ checks.
 - `card_pick(spend_profile)` — top-3 cards by monthly spend match, e.g. `{dining: 500, travel: 800, groceries: 600, other: 1500}`. Live vendor data (andenacitelli/credit-card-bonuses-api, cached) or 3-card offline fallback. Transferable currencies only; vendor flat rates capped at 2.5% and labeled. Static math, no affiliate links — verify bonuses before applying.
 
+## Award search (gated, never breaks)
+
+- `award_search(route, date)` — live award seats via seats.aero, only with `SEATS_AERO_API_KEY` set. Without the key it returns PointsYeah free 4-day manual steps instead of erroring: send the user those steps (search PointsYeah → match programs → check `transfer_partners.json` → `bonus_watch()` before transferring). Zero-key default stays intact.
+
 ## Limits
 
 - No live miles API exists; transfer ratios are static (`data/transfer_partners.json`).

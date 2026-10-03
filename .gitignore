@@ -1,0 +1,4 @@
+# runtime caches — re-fetched automatically, never commit
+data/cards_cache.json
+__pycache__/
+*.pyc
