@@ -13,6 +13,7 @@ Free flight-deals ranker: live prices via free APIs + MCP, miles/credit-card tra
   - `data/transfer_bonuses.json` (active transfer bonuses `{from,to,pct,end_date,source}` — refresh weekly)
   - `data/cpp.json` (TPG-style cents-per-point: Bilt 2.2, Chase UR 2.05, Amex MR 2.0, Citi 1.9, CapOne 1.85, Hyatt 1.55, Marriott 0.8, Hilton 0.35 — illustrative snapshot, re-verify against current TPG valuations)
   - `data/ontime_sample.json` (BTS-style delay/cancel sample for JFK-LAX + SFO-ORD corridors; `ontime_full.json` drop-in for full BTS coverage)
+- **Cards:** live vendor JSON ([andenacitelli/credit-card-bonuses-api](https://github.com/andenacitelli/credit-card-bonuses-api), 175 cards, cached to `data/cards_cache.json`) with 3-card offline fallback; transferable currencies only, vendor flat rates capped at 2.5%. Static math, no affiliate links.
 - **Not used:** Amadeus (free tier shut 2026-07-17 — every Amadeus MCP is a dead backend).
 
 ## Install
@@ -45,6 +46,8 @@ More examples:
 - `rank_compare("JFK", "LAX", "2026-11-20")` — faster-flights vs Skiplagged MCP cross-check; `disputed: true` means verify before booking.
 - `price_signal("JFK-LAX", "2026-11-20")` — SerpAPI price insights (cached-first) + SQLite history; pass `disputed: true` after a disputed compare for a fresh pull.
 - `delay_risk("AA", "JFK", "LAX", "7")` — misconnect probability; feed into `rank` via `{"apply_delay_penalty": true, ...}` to penalize tight connections.
+- `price_watch("JFK", "LAX", "2026-11-20", 250)` — check-on-query fare watch (Skiplagged + SQLite trend). No daemon, no key.
+- `card_pick({"dining": 500, "travel": 800, "groceries": 600, "other": 1500})` — top-3 cards by spend match from the FOSS card-bonuses API (cached to `data/cards_cache.json`, 3-card offline fallback). Static math, no affiliate links.
 
 ## Weekly refresh
 
