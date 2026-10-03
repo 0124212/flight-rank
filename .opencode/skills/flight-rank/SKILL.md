@@ -34,6 +34,11 @@ Rank flights by price/timing + miles transfer value. Free data only.
 - `price_signal(route, date)` — SerpAPI `price_insights`, cached read first (free), fresh pull only on miss/dispute. History lands in SQLite (`/tmp/flight-rank/history.db`). No `SERPAPI_KEY` → skips gracefully, say so.
 - `delay_risk(carrier, origin, dest, month)` — BTS-sample misconnect probability. For tight connections add `rank` prefs `{"apply_delay_penalty": true, "origin": ..., "dest": ..., "month": ...}` — score gains `misconnect_prob × $150` (tune via `delay_dollars`). Sample covers JFK-LAX + SFO-ORD corridors only; anything else falls back to route/global average and says so (`match` field).
 
+## Watch + cards (zero keys)
+
+- `price_watch(origin, dest, date, target_price)` — check-on-query fare watch (Skiplagged + fallback, SQLite trend in `/tmp/flight-rank/history.db`). No daemon: below-target → "book now", above → state current vs target and re-check next query. Trend (`moved $X → $Y`) only appears after 2+ checks.
+- `card_pick(spend_profile)` — top-3 cards by monthly spend match, e.g. `{dining: 500, travel: 800, groceries: 600, other: 1500}`. Live vendor data (andenacitelli/credit-card-bonuses-api, cached) or 3-card offline fallback. Transferable currencies only; vendor flat rates capped at 2.5% and labeled. Static math, no affiliate links — verify bonuses before applying.
+
 ## Limits
 
 - No live miles API exists; transfer ratios are static (`data/transfer_partners.json`).
