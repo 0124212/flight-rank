@@ -5,6 +5,8 @@ Free flight-deals ranker: live prices via free APIs + MCP, miles/credit-card tra
 
 `git clone + ./install.sh` wires a `flight-rank` MCP + skill into OpenCode on any Linux/Mac. No paid keys required.
 
+> Dad? Just want it working: see [DAD_SETUP.md](DAD_SETUP.md) — 5 steps, ~2 min, zero keys.
+
 ## Free stack (and limits)
 
 - **Live prices:** [`faster-flights`](https://pypi.org/project/faster-flights/) (fork of `fast-flights`) — $0, no key, live Google Flights scrape. Pinned in `requirements.txt`.
