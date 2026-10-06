@@ -21,12 +21,20 @@ Cache: 1-hr JSON files in $TMPDIR/flight-rank/.
 import hashlib
 import json
 import os
+import re
 import tempfile
 import time
+import datetime
+import functools
 import urllib.parse
 from pathlib import Path
 
-import httpx
+
+def _httpx():
+    """Lazy httpx import — keeps cold-start/RAM low on boxes that only use static paths."""
+    import httpx  # local import: no network lib loaded until a live call runs
+
+    return httpx
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -116,7 +124,7 @@ def _via_serpapi(origin, dest, date, cabin, adults):
         "api_key": key,
     }
     r = _with_backoff(
-        lambda: httpx.get("https://serpapi.com/search.json", params=params, timeout=30)
+        lambda: _httpx().get("https://serpapi.com/search.json", params=params, timeout=30)
     )
     r.raise_for_status()
     return r.json()
@@ -141,6 +149,7 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
             if isinstance(price, str):
                 digits = "".join(c for c in price if c.isdigit() or c == ".")
                 price = float(digits) if digits else None
+            segs, mixed = _mixed_flag(f.get("segments") or f.get("legs"), "?")
             out.append(
                 {
                     "price": price,
@@ -149,6 +158,7 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
                     "duration": f.get("duration") or f.get("travel_time") or "?",
                     "depart": f.get("departure") or f.get("depart_time") or "?",
                     "arrive": f.get("arrival") or f.get("arrive_time") or "?",
+                    "segments": segs, "mixed_cabin": mixed,
                     "link": f.get("link") or link,
                 }
             )
@@ -164,6 +174,14 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
                 arr = getattr(getattr(legs[-1], "arrival", ""), "time", None) or getattr(
                     legs[-1], "arrival", "?"
                 )
+                dsegs = []
+                for leg in legs:
+                    lo = getattr(leg, "origin", None) or getattr(leg, "origin_airport", None)
+                    ld = getattr(leg, "destination", None) or getattr(leg, "destination_airport", None)
+                    if lo or ld:
+                        dsegs.append({"origin": str(lo) if lo else None,
+                                      "dest": str(ld) if ld else None})
+                dsegs, dmixed = _mixed_flag(dsegs, "?")
                 out.append(
                     {
                         "price": getattr(f, "price", None),
@@ -172,6 +190,7 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
                         "duration": dur,
                         "depart": str(dep),
                         "arrive": str(arr),
+                        "segments": dsegs, "mixed_cabin": dmixed,
                         "link": link,
                     }
                 )
@@ -224,6 +243,32 @@ def _search_impl(origin, dest, date, cabin="economy", adults=1, currency="USD"):
     return res
 
 
+def _search_legs_impl(legs, cabin="economy", adults=1):
+    """Multi-city: chain _search_impl per {o,d,date} leg, cheapest each + trip total."""
+    if isinstance(legs, dict):
+        legs = [legs]
+    out, total, errors = [], 0.0, []
+    for i, leg in enumerate(legs or []):
+        if not isinstance(leg, dict):
+            continue
+        try:
+            o, d, dt = (leg.get("o") or leg.get("origin", "")).upper().strip(), \
+                       (leg.get("d") or leg.get("dest", "")).upper().strip(), leg.get("date")
+            r = _search_impl(o, d, dt, cabin, adults)
+            priced = [x for x in r.get("options", []) if isinstance(x.get("price"), (int, float))]
+            best = min(priced, key=lambda x: x["price"]) if priced else {"error": r.get("error", "no options")}
+            if isinstance(best.get("price"), (int, float)):
+                total += best["price"]
+            out.append({"leg": i + 1, "route": f"{o}-{d}", "date": dt, "cheapest": best})
+        except Exception as e:  # noqa: BLE001 — one leg failing never kills the trip
+            errors.append(f"leg {i + 1}: {e}")
+            out.append({"leg": i + 1, "route": "?", "date": None, "cheapest": {"error": str(e)[:120]}})
+    res = {"legs": out, "trip_total_usd": round(total, 2)}
+    if errors:
+        res["errors"] = errors
+    return res
+
+
 def _rank_impl(options, prefs=None):
     prefs = prefs or {}
     cpp = float((prefs.get("value_per_point_cents") or 1.3)) / 100.0  # $/pt
@@ -273,6 +318,7 @@ def _rank_impl(options, prefs=None):
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
 
+@functools.lru_cache(maxsize=8)  # ponytail: static files only; restart to pick up edits
 def _load_json(name):
     try:
         return json.loads((DATA_DIR / name).read_text())
@@ -308,6 +354,47 @@ def _cpp_impl(points, program, cash_price):
     }
 
 
+_MILES_EXPIRY = {  # static rules — verify at booking time; Asiana cutoff per wind-down
+    "korean air": "expire 10y from accrual",
+    "asiana": "expire 10y from accrual; EARNING ENDS 2026-12-16 — book by 2026-12-01",
+    "american": "expire after 24mo inactivity (any earn/redeem resets)",
+    "aa": "expire after 24mo inactivity (any earn/redeem resets)",
+    "delta": "never expire",
+}
+_OZ_CUTOFF = "2026-12-16"
+
+
+def _oz_guard(row):
+    """Block/warn OZ-earning bonus rows around the earn cutoff. Returns note or None."""
+    blob = " ".join(str((row or {}).get(k, "")) for k in ("program", "partner", "to", "from")).lower()
+    if "asiana" not in blob:
+        return None
+    end = (row or {}).get("end_date")
+    if end and end <= _OZ_CUTOFF:
+        return "OZ-earning bonus ends before the 2026-12-16 cutoff — book by 2026-12-01"
+    return ("BLOCKED after 2026-12-16: Asiana Club earning ends — "
+            "do not transfer for OZ post-cutoff dates; book by 2026-12-01")
+
+
+def _bonus_expiry_sort(bonuses):
+    """Attach days_left + oz_guard; soonest-expiring first (no end_date last)."""
+    today = time.strftime("%Y-%m-%d")
+    out = []
+    for b in bonuses or []:
+        end = (b or {}).get("end_date")
+        try:
+            dl = (datetime.date.fromisoformat(end) - datetime.date.fromisoformat(today)).days if end else None
+        except ValueError:
+            dl = None
+        b2 = {**(b or {}), "days_left": dl}
+        g = _oz_guard(b)
+        if g:
+            b2["oz_guard"] = g
+        out.append(b2)
+    out.sort(key=lambda b: (b["days_left"] is None, b["days_left"] or 0))
+    return out
+
+
 def _bonus_watch_impl():
     d = _load_json("transfer_bonuses.json")
     if "_error" in d:
@@ -318,7 +405,7 @@ def _bonus_watch_impl():
         (active if not b.get("end_date") or b["end_date"] >= today else expired).append(b)
     return {
         "last_checked": d.get("last_checked"),
-        "active": active,
+        "active": _bonus_expiry_sort(active),
         "expired_count": len(expired),
         "note": "Bonuses are time-limited — verify live before transferring.",
     }
@@ -363,7 +450,7 @@ def _skiplagged_search(origin, dest, date):
     """Skiplagged public MCP (streamable HTTP) → option cards. Raises on any failure."""
     url = "https://mcp.skiplagged.com/mcp"
     headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json"}
-    with httpx.Client(timeout=30) as c:
+    with _httpx().Client(timeout=30) as c:
         init = c.post(url, headers=headers, json={
             "jsonrpc": "2.0", "id": 1, "method": "initialize",
             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -464,25 +551,22 @@ def _hhmm(s):
 
 
 def _rank_compare_impl(origin, dest, date, cabin="economy", adults=1):
-    from concurrent.futures import ThreadPoolExecutor
     origin, dest = origin.upper().strip(), dest.upper().strip()
     key = _cache_key("compare", {"origin": origin, "dest": dest, "date": date,
                                  "cabin": cabin, "adults": adults})
     hit = _cache_get(key)
     if hit is not None:
         return hit
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f1 = ex.submit(_search_impl, origin, dest, date, cabin, adults)
-        f2 = ex.submit(_skiplagged_search, origin, dest, date)
-        try:
-            primary = f1.result()
-        except Exception as e:  # noqa: BLE001
-            primary = {"source": "none", "options": [], "error": str(e)}
-        secondary, serr = None, None
-        try:
-            secondary = f2.result()
-        except Exception as e:  # noqa: BLE001
-            serr = str(e)
+    # ponytail: serial, not ThreadPool — low-RAM box; two HTTP calls, no CPU gain from threads
+    try:
+        primary = _search_impl(origin, dest, date, cabin, adults)
+    except Exception as e:  # noqa: BLE001
+        primary = {"source": "none", "options": [], "error": str(e)}
+    secondary, serr = None, None
+    try:
+        secondary = _skiplagged_search(origin, dest, date)
+    except Exception as e:  # noqa: BLE001
+        serr = str(e)
 
     def cheapest(opts):
         priced = [o for o in opts if isinstance(o.get("price"), (int, float))]
@@ -543,12 +627,26 @@ def _rank_compare_impl(origin, dest, date, cabin="economy", adults=1):
 def _price_history_db():
     import sqlite3
     con = sqlite3.connect(CACHE_DIR / "history.db")
+    try:  # ponytail: WAL for low-RAM concurrent reads; ignore on exotic filesystems
+        con.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     con.execute("CREATE TABLE IF NOT EXISTS price_signals"
                 "(route TEXT, date TEXT, lowest_price REAL, fetched_at REAL, cached INTEGER,"
                 " PRIMARY KEY (route, date))")
     con.execute("CREATE TABLE IF NOT EXISTS price_watches"
                 "(route TEXT, date TEXT, target_price REAL, last_price REAL, last_checked REAL,"
                 " PRIMARY KEY (route, date))")
+    con.execute("CREATE TABLE IF NOT EXISTS award_watches"
+                "(route TEXT, date TEXT, program TEXT, max_miles REAL, last_hit REAL, last_checked REAL,"
+                " PRIMARY KEY (route, date, program))")
+    con.execute("CREATE TABLE IF NOT EXISTS award_miles"
+                "(route TEXT, cabin TEXT, miles REAL, seen_at REAL)")
+    for col, typ in (("remind_every_h", "REAL DEFAULT 24.0"), ("last_notified", "REAL DEFAULT 0")):
+        cols = [r[1] for r in con.execute("PRAGMA table_info(award_watches)").fetchall()]
+        if col not in cols:
+            con.execute(f"ALTER TABLE award_watches ADD COLUMN {col} {typ}")
+    con.commit()
     return con
 
 
@@ -565,7 +663,7 @@ def _price_signal_impl(route, date, disputed=False):
         params = {"engine": "google_flights", "departure_id": o, "arrival_id": d,
                   "outbound_date": date, "api_key": key,
                   "no_cache": "true" if fresh else "false"}
-        r = _with_backoff(lambda: httpx.get("https://serpapi.com/search.json", params=params, timeout=30))
+        r = _with_backoff(lambda: _httpx().get("https://serpapi.com/search.json", params=params, timeout=30))
         r.raise_for_status()
         return r.json()
     data = serp(False)
@@ -703,10 +801,13 @@ def _fetch_cards():
     raw_candidates = [
         "https://raw.githubusercontent.com/andenacitelli/credit-card-bonuses-api/main/exports/data.json",
         "https://raw.githubusercontent.com/andenacitelli/credit-card-bonuses-api/master/exports/data.json",
+        # 2nd-vendor leg: same dataset via jsDelivr CDN (different infra, zero new trust):
+        "https://cdn.jsdelivr.net/gh/andenacitelli/credit-card-bonuses-api@main/exports/data.json",
+        "https://cdn.jsdelivr.net/gh/andenacitelli/credit-card-bonuses-api@master/exports/data.json",
     ]
     for url in raw_candidates:
         try:
-            r = httpx.get(url, timeout=20)
+            r = _httpx().get(url, timeout=20)
             r.raise_for_status()
             d = r.json()
             lst = d if isinstance(d, list) else d.get("cards", d.get("data"))
@@ -717,7 +818,7 @@ def _fetch_cards():
             continue
     if cards is None:
         try:
-            idx = _with_backoff(lambda: httpx.get(
+            idx = _with_backoff(lambda: _httpx().get(
                 "https://api.github.com/repos/andenacitelli/credit-card-bonuses-api/contents/exports",
                 timeout=20, headers={"Accept": "application/vnd.github+json"}))
             idx.raise_for_status()
@@ -725,7 +826,7 @@ def _fetch_cards():
                      if isinstance(e, dict) and (e.get("name", "").endswith(".json"))]
             for url in blobs[:3]:
                 try:
-                    r = httpx.get(url, timeout=20)
+                    r = _httpx().get(url, timeout=20)
                     r.raise_for_status()
                     d = r.json()
                     lst = d if isinstance(d, list) else d.get("cards", d.get("data"))
@@ -816,8 +917,24 @@ def _score_cards(cards, profile):
                 "annual_fee": fee, "net_usd": round(pts * cpp - fee, 2), "bonus": bonus}
         if basis:
             item["rewards_basis"] = basis
+        waived = c.get("annual_fee_waived_yr1", c.get("first_year_fee_waived",
+                       c.get("fee_waived_first_year", c.get("annualFeeWaived"))))
+        if waived in (True, 1, "true", "yes", "waived"):
+            item["net_yr1_usd"] = round(pts * cpp, 2)  # yr-1 fee waived → fee counts 0
+            item["yr1_fee_waiver"] = True
+        bend = c.get("bonus_end_date", c.get("bonusExpires", c.get("offer_end_date",
+                 c.get("bonusEndDate"))))
+        try:
+            bl = (datetime.date.fromisoformat(str(bend)) - datetime.date.today()).days \
+                if bend else None
+        except ValueError:
+            bl = None
+        if bl is not None and bl <= 90:  # bonus-expiry weighting: urgency flag + rank input
+            item["bonus_urgency"] = "urgent" if bl <= 30 else "expiring"
+            item["bonus_days_left"] = bl
         scored.append(item)
-    scored.sort(key=lambda s: s["net_usd"], reverse=True)
+    scored.sort(key=lambda s: (s.get("net_yr1_usd", s["net_usd"]),
+                               1 if s.get("bonus_urgency") == "urgent" else 0), reverse=True)
     return scored
 
 
@@ -834,19 +951,56 @@ def _card_pick_impl(spend_profile):
                      "Bonuses change — verify current offers before applying.")}
 
 
+_NEED_GUIDE = {
+    "route": {"field": "route", "example": "ICN-LAX",
+              "why": "origin + destination drive every award lookup",
+              "how": "paste ORIG-DEST (nearby airports auto-expanded)"},
+    "date": {"field": "date", "example": "2026-11-20",
+             "why": "award space changes daily; calendar scans ±window around it",
+             "how": "paste outbound YYYY-MM-DD (add return date for round trips)"},
+    "program": {"field": "program", "example": "aeroplan",
+                "why": "cpp math + transfer routing need the program",
+                "how": "paste program name or code (aeroplan / united / delta / asiana)"},
+    "cabin": {"field": "cabin", "example": "economy",
+              "why": "saver ceilings differ by cabin",
+              "how": "paste economy / premium / business / first (default economy)"},
+    "seats_key": {"field": "SEATS_AERO_API_KEY",
+                  "why": "unlocks live seats.aero cached search (free path stays: bookable deep links)",
+                  "how": "paste key from seats.aero/settings (Pro ~$9.99/mo) as env SEATS_AERO_API_KEY"},
+    "duffel_key": {"field": "DUFFEL_API_KEY_LIVE",
+                   "why": "GDS cash anchor beats scrape estimates",
+                   "how": "paste key from duffel.com dashboard as env DUFFEL_API_KEY_LIVE (scrape fallback otherwise)"},
+    "delta_curl": {"field": "DELTA_CURL_FILE",
+                   "why": "Delta cookie-replay borrows your own delta.com session",
+                   "how": "devtools Network → copy the rm-offer-gql request as cURL → save to a file → set DELTA_CURL_FILE to its path (cookies expire ~30 min)"},
+}
+
+
+def _need_from_you(*fields):
+    """Intake-first UX: structured ask-Juni blocks. Never invent availability."""
+    return [_NEED_GUIDE[f] for f in fields if f in _NEED_GUIDE]
+
+
 def _award_search_impl(route, date):
     """seats.aero Cached Search passthrough (gated). No key → message + PointsYeah manual steps."""
     route = (route or "").upper().strip()
     if "-" not in route:
-        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT"}
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT",
+                "need_from_you": _need_from_you("route")}
     o, d = [p.strip() for p in route.split("-", 1)]
+    if not (date or "").strip():
+        return {"route": route, "error": "date missing",
+                "need_from_you": _need_from_you("date")}
     key = os.environ.get("SEATS_AERO_API_KEY", "")
     if not key:
         return {"route": route, "date": date, "source": "none", "availability": [],
                 "message": "SEATS_AERO_API_KEY absent — award search needs a seats.aero key; nothing broke.",
+                "need_from_you": _need_from_you("seats_key"),
+                "free_links": _award_free_links(route, date),
                 "manual_crosscheck": {
                     "tool": "PointsYeah.com (free plan shows ±4 days around your date)",
                     "steps": ["Search your route + date on PointsYeah",
+                              "Or open free_links.aa_award / free_links.southwest_points for live AA/WN award results",
                               "Note which programs show award seats",
                               "Check transfer_partners.json: which of your bank points transfer there",
                               "Call bonus_watch() before transferring — a bonus cuts the points needed",
@@ -856,19 +1010,33 @@ def _award_search_impl(route, date):
     if hit is not None:
         return hit
     try:
-        r = _with_backoff(lambda: httpx.get(
+        r = _with_backoff(lambda: _httpx().get(
             "https://api.seats.aero/partnerapi/search",
             params={"origin_airport": o, "destination_airport": d,
                     "start_date": date, "end_date": date},
             headers={"Partner-Authorization": f"Bearer {key}"}, timeout=30))
         r.raise_for_status()
         res = {"route": route, "date": date, "source": "seats.aero",
-               "availability": _normalize_awards(r.json(), route, date)}
+               "availability": _filter_awards(_normalize_awards(r.json(), route, date))}
+        _record_award_miles(route, res["availability"])
         _cache_put(cache_key, res)
         return res
     except Exception as e:  # noqa: BLE001 — never break: key present but call failed
         return {"route": route, "date": date, "source": "seats.aero",
                 "availability": [], "message": f"seats.aero call failed ({e}); try again or use PointsYeah steps"}
+
+
+def _mixed_flag(segments, top_cabin="?"):
+    """segments[] → (trimmed segments, mixed_cabin bool). Cabins differ → mixed."""
+    segs = []
+    for s in (segments or [])[:4]:
+        if not isinstance(s, dict):
+            continue
+        segs.append({k: s.get(k) for k in ("origin", "dest", "cabin", "flight")
+                     if s.get(k) is not None})
+    cabins = {s.get("cabin", top_cabin) for s in segs} | {top_cabin}
+    cabins.discard("?")
+    return segs, len(cabins) > 1
 
 
 def _normalize_awards(raw, route, date):
@@ -878,15 +1046,565 @@ def _normalize_awards(raw, route, date):
     for f in items[:15]:
         if not isinstance(f, dict):
             continue
+        cabin = f.get("cabin") or f.get("cabin_class") or "?"
+        segs, mixed = _mixed_flag(f.get("segments") or f.get("trips") or f.get("legs"), cabin)
         out.append({
             "program": f.get("mileage_program") or f.get("source") or "unknown",
-            "cabin": f.get("cabin") or f.get("cabin_class") or "?",
+            "cabin": cabin,
             "date": f.get("date") or f.get("departure_date") or date,
+            "miles": f.get("mileage_cost") or f.get("miles") or f.get("YMileageCost"),
             "seats": f.get("remaining_seats", f.get("availability_count", "?")),
             "route": route,
+            "segments": segs, "mixed_cabin": mixed,
             "link": f"https://seats.aero/search?min_seats=1&applicable_cabin=any&additional_days=false&additional_days_roundtrip=false&origin_airport={route.split('-')[0]}&destination_airport={route.split('-')[1]}&date={date}",
         })
     return out
+
+
+def _award_free_links(route, date):
+    """No-key bookable deep links. URL patterns from tszumowski/aa_flight_search_tool
+    generate_url + borski/sw-fares build_url (both MIT). Pure stdlib, zero deps."""
+    parts = (route or "").upper().split("-", 1)
+    o = parts[0].strip() if parts else ""
+    d = parts[1].strip() if len(parts) > 1 else ""
+    aa = (f"https://www.aa.com/booking/search?locale=en_US&pax=1&adult=1&child=0&type=OneWay"
+          f"&searchType=Award&cabin=&carriers=ALL&slices=%5B%7B%22orig%22:%22{o}%22,"
+          f"%22origNearby%22:true,%22dest%22:%22{d}%22,%22destNearby%22:true,"
+          f"%22date%22:%22{date}%22%7D%5D&maxAwardSegmentAllowed=2")
+    wn = (f"https://www.southwest.com/air/booking/select.html?adultPassengersCount=1"
+          f"&departureDate={date}&departureTimeOfDay=ALL_DAY&destinationAirportCode={d}"
+          f"&fareType=POINTS&originationAirportCode={o}&passengerType=ADULT"
+          f"&returnTimeOfDay=ALL_DAY&tripType=oneway")
+    return {"aa_award": aa,
+            "delta_search": "https://www.delta.com/flightsearch/book-a-flight",
+            "southwest_points": wn,
+            "pointsyeah": "https://www.pointsyeah.com"}
+
+
+def _filter_awards(cards, max_miles=None, min_seats=1, cabins=None):
+    """Port of tszumowski filter_flights (MIT) to award-card dicts. Unknown values pass."""
+    out = []
+    for c in cards or []:
+        if not isinstance(c, dict):
+            continue
+        if cabins and str(c.get("cabin", "?")) not in cabins:
+            continue
+        try:
+            if max_miles is not None and c.get("miles") is not None \
+                    and float(c["miles"]) > max_miles:
+                continue
+        except (TypeError, ValueError):
+            pass
+        try:
+            s = c.get("seats")
+            if s is not None and not isinstance(s, bool) and str(s).strip() != "?" \
+                    and int(s) < min_seats:
+                continue
+        except (TypeError, ValueError):
+            pass
+        out.append(c)
+    return out
+
+
+_NEARBY = {  # pfei-sa/seats-aero-viz CITY_TO_IATA pattern (MIT): metro expansion
+    "ICN": ["ICN", "GMP"], "GMP": ["GMP", "ICN"], "SEL": ["ICN", "GMP"],
+    "NRT": ["NRT", "HND"], "HND": ["HND", "NRT"], "TYO": ["NRT", "HND"],
+    "JFK": ["JFK", "EWR", "LGA"], "EWR": ["EWR", "JFK", "LGA"], "LGA": ["LGA", "JFK", "EWR"],
+}
+
+_SAVER_TOTAL_CAPS = {"american": 100000, "aa": 100000, "aadvantage": 100000,
+                      "alaska": 150000, "as": 150000}  # borski thresholds (MIT)
+
+
+def _saver_flag(program, miles, max_miles=30000):
+    """saver/dynamic/unknown per card. Totals from borski; else max_miles ceiling."""
+    if miles is None:
+        return "unknown"
+    try:
+        m = float(miles)
+    except (TypeError, ValueError):
+        return "unknown"
+    cap = _SAVER_TOTAL_CAPS.get((program or "").strip().lower())
+    if cap is None:  # "American Airlines" → token "american"; exact first so "as" never fuzzy-hits
+        for tok in (program or "").strip().lower().replace("/", " ").split():
+            if tok in _SAVER_TOTAL_CAPS:
+                cap = _SAVER_TOTAL_CAPS[tok]
+                break
+    if cap is not None:
+        return "saver" if m < cap else "dynamic"
+    return "saver" if m <= max_miles else "dynamic"
+
+
+def _transfer_options(program):
+    """transfer_partners.json rows matching a program name (substring, case-insensitive)."""
+    d = _load_json("transfer_partners.json")
+    if "_error" in d:
+        return []
+    want = (program or "").strip().lower()
+    return [t for t in d.get("transfers", []) if want and want in str(t.get("airline", "")).lower()]
+
+
+def _korea_block(o, d):
+    """KE/OZ earn-via rows + SkyTeam note for Korea-touching routes."""
+    if not ({o, d} & {"ICN", "GMP", "SEL"}):
+        return {}
+    return {"korea_programs": [
+                {"program": "Korean Air SKYPASS", "earn_via": _transfer_options("korean air")},
+                {"program": "Asiana Club", "earn_via": _transfer_options("asiana")}],
+            "skyteam_note": ("KE is SkyTeam: the same seat is often bookable via Delta SkyMiles, "
+                             "Virgin Atlantic, or Flying Blue — compare before transferring.")}
+
+
+def _saver_counts(cards):
+    """Per-day saver/dynamic/unknown tallies (pfei-sa get_route_df grouping pattern, MIT)."""
+    n = {"saver": 0, "dynamic": 0, "unknown": 0}
+    for c in cards or []:
+        n[c.get("saver", "unknown") if c.get("saver") in n else "unknown"] += 1
+    return n
+
+
+def _positioning_leg(home, origin, date):
+    """Cheapest home→origin cash card via _search_impl. None when unset/same/empty."""
+    home = (home or "").upper().strip()
+    if not home or home == origin:
+        return None
+    try:
+        opts = _search_impl(home, origin, date).get("options", [])
+        priced = [x for x in opts if isinstance(x.get("price"), (int, float))]
+        if not priced:
+            return None
+        best = min(priced, key=lambda x: x["price"])
+        return {"from": home, "to": origin, "date": date, **best}
+    except Exception:
+        return None
+
+
+def _award_calendar_impl(route, date=None, dates=None, window=7, max_miles=30000, home=None):
+    """±window saver scan (borski award-calendar orchestration, MIT). Keyed loop; no key → links."""
+    route = (route or "").upper().strip()
+    if "-" not in route:
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT",
+                "need_from_you": _need_from_you("route")}
+    o, d = [p.strip() for p in route.split("-", 1)]
+    if dates:
+        days = sorted({str(x) for x in dates})
+    elif date:
+        try:
+            c = datetime.date.fromisoformat(str(date))
+        except ValueError:
+            return {"error": "date must be YYYY-MM-DD",
+                    "need_from_you": _need_from_you("date")}
+        window = max(0, min(int(window), 15))
+        days = [(c + datetime.timedelta(days=i)).isoformat() for i in range(-window, window + 1)]
+    else:
+        return {"error": "pass date=YYYY-MM-DD or dates=[...]",
+                "need_from_you": _need_from_you("date")}
+    pairs = [(a, b) for a in _NEARBY.get(o, [o]) for b in _NEARBY.get(d, [d])]
+    key = os.environ.get("SEATS_AERO_API_KEY", "")
+    base = {"route": route, "pairs": [f"{a}-{b}" for a, b in pairs],
+            "max_miles": max_miles, "home": (home or "").upper().strip() or None,
+            "positioning": _positioning_leg(home, o, days[len(days) // 2]),
+            **_korea_block(o, d)}
+    if not key:
+        by_day = {day: {"availability": [], "saver_counts": _saver_counts([]),
+                        "free_links": _award_free_links(f"{pairs[0][0]}-{pairs[0][1]}", day)}
+                  for day in days}
+        return _calendar_delta_merge(
+                {**base, "source": "none", "by_day": by_day,
+                 "density": [{"date": day, "saver": 0, "dynamic": 0, "unknown": 0, "total": 0}
+                             for day in days],
+                 "need_from_you": _need_from_you("seats_key"),
+                 "message": "SEATS_AERO_API_KEY absent — per-date bookable links above; set key for live saver scan."},
+                route, days)
+    ckey = _cache_key("awardcal", {"route": route, "days": days, "max_miles": max_miles})
+    hit = _cache_get(ckey)
+    if hit is not None:
+        return _calendar_delta_merge(hit, route, days)
+    by_day, errors = {}, []
+    for day in days:
+        cards = []
+        for a, b in pairs:
+            try:
+                r = _award_search_impl(f"{a}-{b}", day)
+                for c in r.get("availability", []):
+                    cards.append({**c, "pair": f"{a}-{b}",
+                                  "saver": _saver_flag(c.get("program"), c.get("miles"), max_miles)})
+            except Exception as e:  # noqa: BLE001 — one pair failing never kills the day
+                errors.append(f"{a}-{b}@{day}: {e}")
+        cards = _filter_awards(cards, max_miles=max_miles)
+        def _mc(c):
+            try:
+                return float(c.get("miles"))
+            except (TypeError, ValueError):
+                return float("inf")
+        best = min(cards, key=_mc, default=None)
+        if best is not None and _mc(best) == float("inf"):
+            best = None
+        by_day[day] = {"availability": cards, "saver_counts": _saver_counts(cards),
+                       "cheapest": ({k: best[k] for k in ("program", "cabin", "miles", "pair")}
+                                    if best else None)}
+    res = {**base, "source": "seats.aero", "by_day": by_day,
+           "density": [{"date": day, **_saver_counts(by_day[day]["availability"]),
+                        "total": len(by_day[day]["availability"])} for day in days]}
+    if errors:
+        res["errors"] = errors
+    _cache_put(ckey, res)
+    return _calendar_delta_merge(res, route, days)
+
+
+def _calendar_delta_merge(out, route, days):
+    """One-shot Delta replay (center date) merged when DELTA_CURL_FILE is set. Never breaks."""
+    if not os.environ.get("DELTA_CURL_FILE", "") or not days:
+        return out
+    try:
+        out["delta_replay"] = _award_delta_scan(route, days[len(days) // 2])
+    except Exception as e:  # noqa: BLE001
+        out["delta_replay"] = {"error": str(e)[:120]}
+    return out
+
+
+_DELTA_OFFER_URL = "https://offer-api-prd.delta.com/prd/rm-offer-gql"
+
+_DELTA_GQL = """query ($offerSearchCriteria: OfferSearchCriteriaInput!) {
+  gqlSearchOffers(offerSearchCriteria: $offerSearchCriteria) {
+    gqlOffersSets {
+      trips { tripId originAirportCode destinationAirportCode stopCnt }
+      offers {
+        offerId soldOut
+        additionalOfferProperties { fareType soldOut unavailableForSale }
+        offerItems { retailItems { retailItemMetaData { fareInformation {
+          availableSeatCnt
+          farePrice { totalFarePrice { milesEquivalentPrice { mileCnt } } }
+        } } } }
+      }
+    }
+  }
+}"""
+
+
+def _delta_parse_curl(curl_text):
+    """Port of jeremyyma parse_curl (MIT): cookies + headers out of a copied curl."""
+    m = re.search(r"-b '([^']+)'", curl_text) or re.search(r'--cookie "([^"]+)"', curl_text)
+    cookies = m.group(1) if m else ""
+    headers = {}
+    for pat in (r"-H '([^']+)'", r'-H "([^"]+)"'):
+        for h in re.finditer(pat, curl_text):
+            k, _, v = h.group(1).partition(": ")
+            if v:
+                headers[k.lower()] = v
+    return cookies, headers
+
+
+def _delta_payload(origin, dest, date, seats=1):
+    """One-way single-date port of jeremyyma build_payload (MIT)."""
+    dt = datetime.datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%dT00:00:00")
+    return {"variables": {"offerSearchCriteria": {
+        "productGroups": [{"productCategoryCode": "FLIGHTS"}],
+        "offersCriteria": {
+            "resultsPageNum": 1, "resultsPerRequestNum": 30,
+            "preferences": {"refundableOnly": False, "nonStopOnly": False, "excludeBrandTypes": []},
+            "pricingCriteria": {"priceableIn": ["MILES"]},
+            "flightRequestCriteria": {"searchOriginDestination": [
+                {"departureLocalTs": dt, "destinations": [{"airportCode": dest}],
+                 "origins": [{"airportCode": origin}]}]}},
+        "customers": [{"passengerTypeCode": "ADT", "passengerId": str(i)}
+                      for i in range(1, seats + 1)]}},
+        "query": _DELTA_GQL}
+
+
+def _delta_extract(data, route, date, max_miles=30000):
+    """Port of jeremyyma extract_results (MIT): GraphQL walk → uniform cards."""
+    try:
+        sets = data["data"]["gqlSearchOffers"]["gqlOffersSets"]
+    except (KeyError, TypeError):
+        return []
+    cards = []
+    for s in sets or []:
+        trips = s.get("trips") or []
+        t0 = trips[0] if trips and isinstance(trips[0], dict) else {}
+        for offer in s.get("offers") or []:
+            props = offer.get("additionalOfferProperties") or {}
+            if offer.get("soldOut") or props.get("soldOut") or props.get("unavailableForSale"):
+                continue
+            cabin = props.get("fareType", "?")
+            segs, mixed = _mixed_flag(
+                [{"origin": t0.get("originAirportCode"), "dest": t0.get("destinationAirportCode"),
+                  "cabin": cabin}] if t0 else [], cabin)
+            for item in offer.get("offerItems") or []:
+                for retail in item.get("retailItems") or []:
+                    fis = (retail.get("retailItemMetaData") or {}).get("fareInformation") or []
+                    for fi in ([fis] if isinstance(fis, dict) else fis):
+                        seats = fi.get("availableSeatCnt") or 0
+                        fps = fi.get("farePrice") or []
+                        for fp in ([fps] if isinstance(fps, dict) else fps):
+                            miles = ((fp.get("totalFarePrice") or {})
+                                     .get("milesEquivalentPrice", {}).get("mileCnt", 0))
+                            if miles and miles <= max_miles:
+                                cards.append({"program": "Delta SkyMiles",
+                                              "cabin": cabin, "date": date,
+                                              "miles": miles, "seats": seats, "route": route,
+                                              "segments": segs, "mixed_cabin": mixed,
+                                              "saver": _saver_flag("delta", miles, max_miles),
+                                              "link": "https://www.delta.com/flightsearch/book-a-flight"})
+    return cards
+
+
+def _award_delta_scan(route, date, max_miles=30000):
+    """Opt-in Delta cookie-replay saver scan (jeremyyma/AwardFlightSearch, MIT).
+    Stub: gated on DELTA_CURL_FILE, curl_cffi soft-imported. No hard deps."""
+    base = {"route": route, "date": date, "source": "delta-replay", "availability": []}
+    curl_file = os.environ.get("DELTA_CURL_FILE", "")
+    if not curl_file or not Path(curl_file).exists():
+        return {**base, "message": "DELTA_CURL_FILE absent — paste a fresh delta.com "
+                "rm-offer-gql curl (cookies expire ~30 min).",
+                "need_from_you": _need_from_you("route", "date", "delta_curl")}
+    try:
+        from curl_cffi import requests as _cffi  # noqa: F401 — soft dep only
+    except ImportError:
+        return {**base, "message": "curl_cffi missing — pip install curl-cffi to enable "
+                "the Delta replay scan."}
+    route = (route or "").upper().strip()
+    if "-" not in route:
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT",
+                "need_from_you": _need_from_you("route")}
+    o, d = [p.strip() for p in route.split("-", 1)]
+    cookies, bh = _delta_parse_curl(Path(curl_file).read_text())
+    if not cookies:
+        return {**base, "message": "No cookies parsed from DELTA_CURL_FILE — re-copy the "
+                "rm-offer-gql curl from Chrome."}
+    mc = re.search(r"mc_cache_key=([^;]+)", cookies)
+    headers = {"accept": "application/json, text/plain, */*", "airline": "DL",
+               "applicationid": "DC", "authorization": bh.get("authorization", "GUEST"),
+               "channelid": "DCOM", "content-type": "application/json",
+               "origin": "https://www.delta.com", "referer": "https://www.delta.com/",
+               "transactionid": f"{mc.group(1) if mc else 'frankenstein'}_{int(time.time() * 1000)}",
+               "user-agent": bh.get("user-agent", "Mozilla/5.0"),
+               "x-app-route": "search", "x-app-type": "dcom-shop", "Cookie": cookies}
+    try:
+        resp = _cffi.post(_DELTA_OFFER_URL, headers=headers,
+                          json=_delta_payload(o, d, date), impersonate="chrome124", timeout=30)
+    except Exception as e:  # noqa: BLE001 — network wobble, never break
+        return {**base, "message": f"Delta replay request failed ({e})."}
+    if resp.status_code == 444:
+        return {**base, "message": "HTTP 444: session expired — copy a fresh curl and retry."}
+    if resp.status_code != 200:
+        return {**base, "message": f"Delta replay HTTP {resp.status_code}."}
+    cards = _delta_extract(resp.json(), route, date, max_miles)
+    return {**base, "availability": cards,
+            "message": None if cards else f"No Delta saver seats ≤ {max_miles:,} miles."}
+
+
+def _record_award_miles(route, cards):
+    """Append route-cabin-miles samples to history (prune >90d). Never raises."""
+    try:
+        con = _price_history_db()
+        now = time.time()
+        for c in cards or []:
+            try:
+                m = float(c.get("miles"))
+            except (TypeError, ValueError):
+                continue
+            con.execute("INSERT INTO award_miles VALUES (?,?,?,?)",
+                        (route, str(c.get("cabin", "?")), m, now))
+        con.execute("DELETE FROM award_miles WHERE seen_at < ?", (now - 90 * 86400,))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _rarity_impl(route, cabin=None, miles=None, days=30):
+    """Percentile of miles vs last N days same route-cabin. p<=10 grab, p>=90 wait. Unknown-safe."""
+    try:
+        cur = float(miles)
+    except (TypeError, ValueError):
+        return {"pctl": None, "label": "unknown", "samples": 0}
+    try:
+        con = _price_history_db()
+        q = "SELECT miles FROM award_miles WHERE route=? AND seen_at > ?"
+        args = [route, time.time() - days * 86400]
+        if cabin is not None:
+            q += " AND cabin=?"
+            args.append(cabin)
+        hist = [r[0] for r in con.execute(q, args).fetchall()]
+        con.close()
+    except Exception:
+        return {"pctl": None, "label": "unknown", "samples": 0}
+    n = len(hist)
+    if n < 2:
+        return {"pctl": None, "label": "unknown", "samples": n}
+    p = round(100.0 * sum(1 for h in hist if h <= cur) / n, 1)
+    return {"pctl": p, "label": "grab" if p <= 10 else ("wait" if p >= 90 else "fair"),
+            "samples": n}
+
+
+def _award_watch_impl(route, date, max_miles=30000, program=None, action="check",
+                      remind_every_h=24.0):
+    """Check-on-query award watch (price_watch precedent — no daemon). Hit → live bonus wiring."""
+    route = (route or "").upper().strip()
+    if "-" not in route:
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT",
+                "need_from_you": _need_from_you("route")}
+    if not (date or "").strip():
+        return {"route": route, "error": "date missing",
+                "need_from_you": _need_from_you("date")}
+    program = (program or "").strip()
+    con = _price_history_db()
+    if action == "add":
+        con.execute("INSERT OR REPLACE INTO award_watches VALUES (?,?,?,?,?,?,?,?)",
+                    (route, date, program, float(max_miles), None, time.time(),
+                     float(remind_every_h), 0))
+        con.commit()
+        con.close()
+        return {"route": route, "date": date, "program": program or "any",
+                "max_miles": max_miles, "watching": True, "remind_every_h": float(remind_every_h)}
+    if action == "list":
+        rows = con.execute("SELECT route, date, program, max_miles, last_hit, last_checked,"
+                           " remind_every_h, last_notified FROM award_watches").fetchall()
+        con.close()
+        return {"watches": [{"route": r[0], "date": r[1], "program": r[2] or "any",
+                             "max_miles": r[3], "last_hit": r[4],
+                             "remind_every_h": r[6], "last_notified": r[7]} for r in rows]}
+    if action == "remove":
+        con.execute("DELETE FROM award_watches WHERE route=? AND date=? AND program=?",
+                    (route, date, program))
+        con.commit()
+        con.close()
+        return {"route": route, "date": date, "program": program or "any", "watching": False}
+    r = _award_search_impl(route, date)  # action == "check"
+    cards = [c for c in r.get("availability", [])
+             if not program or program.lower() in str(c.get("program", "")).lower()]
+    cards = _filter_awards(cards, max_miles=max_miles)
+    hit = min((c.get("miles") for c in cards if c.get("miles") is not None),
+              key=lambda m: float(m), default=None)
+    now = time.time()
+    prev = con.execute("SELECT remind_every_h, last_notified FROM award_watches"
+                       " WHERE route=? AND date=? AND program=?",
+                       (route, date, program)).fetchone()
+    cadence, last_n = (prev or (float(remind_every_h), 0))
+    con.execute("INSERT OR REPLACE INTO award_watches VALUES (?,?,?,?,?,?,?,?)",
+                (route, date, program, float(max_miles),
+                 float(hit) if hit is not None else None, now, float(cadence), last_n))
+    con.commit()
+    out = {"route": route, "date": date, "program": program or "any",
+           "max_miles": max_miles, "hit": hit is not None,
+           "best_miles": hit, "matches": len(cards)}
+    if hit is not None:
+        out["live_bonuses"] = _fetch_bonus_impl(program=program or None).get("bonuses", [])
+        out["rarity"] = _rarity_impl(route, None, hit)
+        notify = (now - (last_n or 0)) >= float(cadence or 0) * 3600
+        out["notify"] = notify
+        if notify:
+            con.execute("UPDATE award_watches SET last_notified=? WHERE route=? AND date=? AND program=?",
+                        (now, route, date, program))
+            con.commit()
+        out["message"] = ("Under ceiling — check live_bonuses before transferring."
+                          + ("" if notify else " (reminder throttled: already notified this period)"))
+    con.close()
+    return out
+
+
+def _ratio_mult(ratio):
+    """'5:4' → 1.25 bank pts per mile. Unparseable → 1.0."""
+    try:
+        a, b = str(ratio or "1:1").split(":")
+        return float(a) / float(b)
+    except (ValueError, ZeroDivisionError):
+        return 1.0
+
+
+_DUFFEL_CABINS = {"economy": "economy", "premium": "premium_economy",
+                  "business": "business", "first": "first"}  # Duffel cabin_class enum
+
+
+def _duffel_anchor(origin, dest, date, cabin="economy", adults=1):
+    """Opt-in Duffel GDS cash anchor (borski duffel skill, MIT). No key → None. 1h cache."""
+    key = os.environ.get("DUFFEL_API_KEY_LIVE", "")
+    if not key:
+        return None
+    ckey = _cache_key("duffel", {"o": origin, "d": dest, "date": date,
+                                 "cabin": cabin, "adults": adults})
+    hit = _cache_get(ckey)
+    if hit is not None:
+        return hit
+    try:
+        r = _with_backoff(lambda: _httpx().post(
+            "https://api.duffel.com/air/offer_requests?return_offers=true&supplier_timeout=15000",
+            headers={"Accept": "application/json", "Duffel-Version": "v2",
+                     "Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+            json={"data": {"slices": [{"origin": origin, "destination": dest,
+                                       "departure_date": date}],
+                              "passengers": [{"type": "adult"}] * max(1, int(adults)),
+                              "cabin_class": _DUFFEL_CABINS.get(cabin, "economy")}},
+            timeout=30))
+        r.raise_for_status()
+        offers = (r.json().get("data") or {}).get("offers") or []
+        priced = [float(x["total_amount"]) for x in offers
+                  if isinstance(x, dict) and x.get("total_amount") not in (None, "")]
+        if not priced:
+            return None
+        anchor = {"price": min(priced), "source": "duffel",
+                  "ts": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        _cache_put(ckey, anchor)
+        return anchor
+    except Exception:
+        return None  # down/bad key → caller falls back to labeled scrape price
+
+
+def _award_vs_cash_impl(route, date, program, cabin="economy", adults=1):
+    """Cheapest cash (_search_impl) vs program award cards, each scored by _cpp_impl."""
+    route = (route or "").upper().strip()
+    if "-" not in route:
+        return {"error": "route must look like ORIG-DEST, e.g. ICN-NRT",
+                "need_from_you": _need_from_you("route")}
+    if not (date or "").strip():
+        return {"route": route, "error": "date missing",
+                "need_from_you": _need_from_you("date")}
+    if not (program or "").strip():
+        return {"route": route, "date": date, "error": "program missing",
+                "need_from_you": _need_from_you("program")}
+    o, d = [p.strip() for p in route.split("-", 1)]
+    cash_res = _search_impl(o, d, date, cabin, adults)
+    cash_opts = [x for x in cash_res.get("options", []) if isinstance(x.get("price"), (int, float))]
+    cash = min((x["price"] for x in cash_opts), default=None)
+    cash_source = cash_res.get("source")
+    anchor = _duffel_anchor(o, d, date, cabin, adults)
+    if anchor is not None:  # GDS anchor wins over scrape when opted in
+        cash, cash_source = anchor["price"], "duffel"
+    cash_anchor = (anchor or {"price": cash, "source": cash_source or "none",
+                              "ts": time.strftime("%Y-%m-%dT%H:%M:%S")})
+    awards = [c for c in _award_search_impl(route, date).get("availability", [])
+              if program.lower() in str(c.get("program", "")).lower()]
+    banks = _transfer_options(program)  # program → bank currency for cpp math
+    bank = banks[0]["bank"] if banks else None
+    cpp_bank = bank.split()[0] if bank else None  # "Marriott Bonvoy" → "Marriott" (cpp.json key)
+    mult = _ratio_mult(banks[0].get("ratio")) if banks else 1.0
+    rows = []
+    for c in awards:
+        try:
+            miles = int(float(c.get("miles")))
+        except (TypeError, ValueError):
+            rows.append({**c, "verdict": "unknown", "note": "no miles figure — compare manually"})
+            continue
+        if cash is None:
+            rows.append({**c, "cash_price_usd": None, "verdict": "unknown",
+                         "note": "no cash fare found — award price stands alone"})
+            continue
+        if not bank:
+            rows.append({**c, "cash_price_usd": cash, "verdict": "unknown",
+                         "note": f"no transfer row for '{program}' — compare {miles} miles vs ${cash} manually"})
+            continue
+        v = _cpp_impl(round(miles * mult), cpp_bank, cash)
+        if "error" in v:
+            rows.append({**c, "cash_price_usd": cash, "verdict": "unknown",
+                         "note": f"{v['error']} — compare {miles} miles vs ${cash} manually"})
+        else:
+            rows.append({**c, "via": bank, "cash_price_usd": cash,
+                         "points_value_usd": v["points_value_usd"],
+                         "verdict": v["verdict"], "savings_usd": v["savings_usd"]})
+    return {"route": route, "date": date, "program": program, "via": bank,
+            "cash_price_usd": cash, "cash_source": cash_source, "cash_anchor": cash_anchor,
+            "rows": rows}
 
 
 # PROJECT CONSTRAINT — webfetch scope: fetch_bonus reads ONLY static bonus/promo
@@ -897,6 +1615,9 @@ BONUS_SOURCES = [
     "https://www.going.com/guides/credit-card-transfer-bonuses",
     "https://roame.travel/guides/points-transfer-bonuses",
     "https://www.pointstothet.com/transfer-bonuses",
+    # bank-direct (partner-authoritative, bonus-opportunistic; parser takes what matches):
+    "https://creditcards.chase.com/rewards-credit-cards/ultimate-rewards",
+    "https://www.americanexpress.com/en-us/rewards/membership-rewards/transfer-partners",
 ]
 BONUS_TTL = 86400  # 24h — bonus lists move slowly; Jina keyless is 20 RPM, stay far under it
 
@@ -1039,7 +1760,16 @@ def _fetch_bonus_impl(program=None, refresh=False):
         merged = [b for b in merged
                   if want in str(b.get("program", "")).lower()
                   or want in str(b.get("partner", "")).lower()]
-    res = {"bonuses": merged, "answered_by": answered_by or "static-file",
+    prev = _cache_get(ckey, ttl=10 * 86400) or {}  # stale copy OK — only for deval compare
+    old_pct = {(str(b.get("program", "")).lower(), str(b.get("partner", "")).lower()): b.get("bonus_pct")
+               for b in prev.get("bonuses", []) if isinstance(b, dict)}
+    for b in merged:
+        was = old_pct.get((str(b.get("program", "")).lower(), str(b.get("partner", "")).lower()))
+        if isinstance(was, (int, float)) and isinstance(b.get("bonus_pct"), (int, float)) \
+                and b["bonus_pct"] < was:
+            b["deval_watch"] = True
+            b["deval_note"] = f"pct dropped {was}% → {b['bonus_pct']}% since last fetch"
+    res = {"bonuses": _bonus_expiry_sort(merged), "answered_by": answered_by or "static-file",
            "tried": tried, "cached": False,
            "last_checked": static.get("last_checked"),
            "note": "Fares never come from webfetch — bonus/promo pages only."}
@@ -1104,8 +1834,36 @@ if mcp:  # pragma: no cover — thin MCP wrappers over tested impls
 
     @mcp.tool()
     def award_search(route: str, date: str) -> dict:
-        """Award seats via seats.aero (needs SEATS_AERO_API_KEY; without it returns PointsYeah steps)."""
+        """Award seats. Intake-first: ask Juni for route + date (YYYY-MM-DD) first; without SEATS_AERO_API_KEY returns free deep-links + key paste guide (seats.aero/settings Pro ~$9.99/mo)."""
         return _award_search_impl(route, date)
+
+    @mcp.tool()
+    def award_calendar(route: str, date: str = None, dates: list = None,
+                       window: int = 7, max_miles: int = 30000, home: str = None) -> dict:
+        """±window saver scan. Intake-first: ask Juni for route + date/dates + home airport first; key optional (free links + density without it)."""
+        return _award_calendar_impl(route, date, dates, window, max_miles, home)
+
+    @mcp.tool()
+    def award_watch(route: str, date: str, max_miles: int = 30000,
+                    program: str = None, action: str = "check",
+                    remind_every_h: float = 24.0) -> dict:
+        """Check-on-query award watch. Intake-first: ask Juni for route + date + mile ceiling + program first. Hit attaches live bonuses. No daemon."""
+        return _award_watch_impl(route, date, max_miles, program, action, remind_every_h)
+
+    @mcp.tool()
+    def award_vs_cash(route: str, date: str, program: str) -> dict:
+        """Cheapest cash vs program award cards. Intake-first: ask Juni for route + date + program first; DUFFEL_API_KEY_LIVE optional (scrape fallback otherwise)."""
+        return _award_vs_cash_impl(route, date, program)
+
+    @mcp.tool()
+    def delta_scan(route: str, date: str, max_miles: int = 30000) -> dict:
+        """Delta cookie-replay saver scan. Intake-first: ask Juni for route + date first; needs DELTA_CURL_FILE paste (devtools cURL of rm-offer-gql, cookies expire ~30 min)."""
+        return _award_delta_scan(route, date, max_miles)
+
+    @mcp.tool()
+    def search_legs(legs: list, cabin: str = "economy", adults: int = 1) -> dict:
+        """Multi-city: cheapest cash per {o,d,date} leg + trip total."""
+        return _search_legs_impl(legs, cabin, adults)
 
     @mcp.tool()
     def fetch_bonus(program: str = None, refresh: bool = False) -> dict:
