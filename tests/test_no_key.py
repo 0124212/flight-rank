@@ -14,7 +14,7 @@ sys.path.insert(0, str(REPO))
 
 import mcp_server.server as S  # noqa: E402
 
-KEYS = ("SEATS_AERO_API_KEY", "SERPAPI_KEY", "DELTA_CURL_FILE", "DUFFEL_API_KEY_LIVE")
+KEYS = ("SEATS_AERO_API_KEY", "SERPAPI_KEY", "DELTA_CURL_FILE", "DUFFEL_API_KEY_LIVE", "SEARXNG_URL")
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +34,8 @@ def test_2_award_search_no_key():
     assert r["source"] == "none" and r["availability"] == []
     assert r["free_links"]["aa_award"].startswith("https://www.aa.com/booking/search")
     assert any(n["field"] == "SEATS_AERO_API_KEY" for n in r["need_from_you"])
+    assert "partner_search" in r["free_links"]  # KE/OZ partner caches need no key
+    assert "star_note" in r  # ICN route surfaces OZ Star Alliance hints
 
 
 def test_3_award_calendar_no_key():

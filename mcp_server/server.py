@@ -1027,10 +1027,13 @@ def _award_search_impl(route, date):
                 "message": "SEATS_AERO_API_KEY absent — award search needs a seats.aero key; nothing broke.",
                 "need_from_you": _need_from_you("seats_key"),
                 "free_links": _award_free_links(route, date),
+                **_korea_block(o, d),
                 "manual_crosscheck": {
                     "tool": "PointsYeah.com (free plan shows ±4 days around your date)",
                     "steps": ["Search your route + date on PointsYeah",
                               "Or open free_links.aa_award / free_links.southwest_points for live AA/WN award results",
+                              "KE/OZ route? check partner_search: KE via Alaska/Delta/FlyingBlue/Virgin, OZ via Aeroplan/United/Avianca",
+                              "Roame guide (free, no key): free_links.roame_guide for current transfer bonuses",
                               "Note which programs show award seats",
                               "Check transfer_partners.json: which of your bank points transfer there",
                               "Call bonus_watch() before transferring — a bonus cuts the points needed",
@@ -1091,6 +1094,17 @@ def _normalize_awards(raw, route, date):
     return out
 
 
+_PARTNER_SEARCH = {
+    "aeroplan": "https://www.aircanada.com/aeroplan/redeem/availability/outbound",
+    "united_award": "https://www.united.com/en/us/fsr/choose-flights?f=award",
+    "flyingblue": "https://www.flyingblue.com/en/book",
+    "virgin": "https://flywith.virginatlantic.com/en-us/spend-points",
+    "alaska": "https://www.alaskaair.com/search/results?AwardOnly=true",
+    "roame_guide": "https://roame.travel/guides/points-transfer-bonuses",
+    "pointsyeah_guide": "https://www.pointsyeah.com",
+}
+
+
 def _award_free_links(route, date):
     """No-key bookable deep links. URL patterns from tszumowski/aa_flight_search_tool
     generate_url + borski/sw-fares build_url (both MIT). Pure stdlib, zero deps."""
@@ -1108,7 +1122,9 @@ def _award_free_links(route, date):
     return {"aa_award": aa,
             "delta_search": "https://www.delta.com/flightsearch/book-a-flight",
             "southwest_points": wn,
-            "pointsyeah": "https://www.pointsyeah.com"}
+            "pointsyeah": "https://www.pointsyeah.com",
+            "roame_guide": _PARTNER_SEARCH["roame_guide"],
+            "partner_search": _PARTNER_SEARCH}
 
 
 def _filter_awards(cards, max_miles=None, min_seats=1, cabins=None):
@@ -1180,14 +1196,18 @@ def _transfer_options(program):
 
 
 def _korea_block(o, d):
-    """KE/OZ earn-via rows + SkyTeam note for Korea-touching routes."""
+    """KE/OZ partner-cache hints for Korea-touching routes (free, no key)."""
     if not ({o, d} & {"ICN", "GMP", "SEL"}):
         return {}
     return {"korea_programs": [
                 {"program": "Korean Air SKYPASS", "earn_via": _transfer_options("korean air")},
                 {"program": "Asiana Club", "earn_via": _transfer_options("asiana")}],
             "skyteam_note": ("KE is SkyTeam: the same seat is often bookable via Delta SkyMiles, "
-                             "Virgin Atlantic, or Flying Blue — compare before transferring.")}
+                              "Virgin Atlantic, or Flying Blue — compare before transferring."),
+            "star_note": ("OZ is Star Alliance: the same seat is often bookable via "
+                          "Aeroplan, United MileagePlus, or Avianca LifeMiles — "
+                          "search those first; no direct US bank transfers to Asiana."),
+            "partner_search": _PARTNER_SEARCH}
 
 
 def _saver_counts(cards):
