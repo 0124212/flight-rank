@@ -52,6 +52,7 @@ Ask Juni these 3 first when anything is missing (tools echo them back as `need_f
 - `award_watch(route, date, max_miles, program, remind_every_h)` — check-on-query watch; hits attach live bonuses + rarity label; notify throttled per cadence.
 - `award_vs_cash(route, date, program)` — cheapest cash (Duffel anchor when keyed, scrape otherwise) vs program cards via cpp math.
 - `delta_scan(route, date)` — Delta cookie-replay; without the curl file it tells Juni exactly what to paste.
+- `search_legs(legs, cabin, adults)` — multi-city: cheapest cash per `{o,d,date}` leg + trip total. Round trip = two legs.
 
 ## Live bonus fetch (webfetch: bonus pages only, never fares)
 

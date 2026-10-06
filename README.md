@@ -82,6 +82,7 @@ More examples:
 - `award_calendar("ICN-NRT", "2026-11-20")` — ±7d saver scan (`dates=[...]` or `window=N`, `max_miles` ceiling; nearby airports + KE/OZ rows free, live scan with key).
 - `award_watch("ICN-NRT", "2026-11-20", 30000, "aeroplan", "add")` — watch under a mile ceiling (`check`/`list`/`remove`); hits attach live transfer bonuses.
 - `award_vs_cash("ICN-NRT", "2026-11-20", "aeroplan")` — cheapest cash vs each program card, cpp verdict per row.
+- `search_legs([{o: "ICN", d: "NRT", date: "2026-11-20"}, {o: "NRT", d: "ICN", date: "2026-11-27"}])` — multi-city: cheapest cash per leg + trip total (round trips = two legs).
 - `fetch_bonus()` — fresh transfer bonuses, zero-key: SearXNG → Jina keyless → static file. `fetch_bonus("amex")` filters; `refresh=True` busts the 24h cache. `rank_compare` quotes its `bonus_hint` automatically when disputed.
 
 ## Weekly refresh

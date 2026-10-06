@@ -12,6 +12,11 @@ Tools:
   price_watch(origin, dest, date, target_price)
   card_pick(spend_profile)
   award_search(route, date)  # gated: needs SEATS_AERO_API_KEY
+  award_calendar(route, date=None, dates=None, window=7, max_miles=30000, home=None)
+  award_watch(route, date, max_miles=30000, program=None, action="check")
+  award_vs_cash(route, date, program)
+  delta_scan(route, date)  # gated: needs DELTA_CURL_FILE
+  search_legs(legs, cabin="economy", adults=1)
   fetch_bonus(program=None, refresh=False)  # webfetch: bonus pages ONLY, never fares
 
 Primary: faster-flights (live Google Flights scrape, $0, no key).
@@ -130,6 +135,21 @@ def _via_serpapi(origin, dest, date, cabin, adults):
     return r.json()
 
 
+def _to_float(x):
+    """'$1,234' / 1234 / 1234.5 → float. None if unparseable (bool never counts)."""
+    if isinstance(x, bool):
+        return None
+    if isinstance(x, (int, float)):
+        return float(x)
+    if isinstance(x, str):
+        digits = "".join(c for c in x if c.isdigit() or c == ".")
+        try:
+            return float(digits) if digits else None
+        except ValueError:
+            return None
+    return None
+
+
 def _normalize(raw, origin, dest, date) -> list[dict]:
     """Accept scraper objects, dicts, or SerpAPI JSON → uniform cards."""
     items: list = []
@@ -143,12 +163,9 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
         items = []
     out = []
     link = _deep_link(origin, dest, date)
-    for f in items[:15]:
+    for f in items:
         if isinstance(f, dict):
-            price = f.get("price") or f.get("total_price") or f.get("amount")
-            if isinstance(price, str):
-                digits = "".join(c for c in price if c.isdigit() or c == ".")
-                price = float(digits) if digits else None
+            price = _to_float(f.get("price") or f.get("total_price") or f.get("amount"))
             segs, mixed = _mixed_flag(f.get("segments") or f.get("legs"), "?")
             out.append(
                 {
@@ -184,7 +201,7 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
                 dsegs, dmixed = _mixed_flag(dsegs, "?")
                 out.append(
                     {
-                        "price": getattr(f, "price", None),
+                        "price": _to_float(getattr(f, "price", None)),
                         "airline": "+".join(getattr(f, "airlines", []) or ["unknown"]),
                         "stops": stops,
                         "duration": dur,
@@ -197,7 +214,7 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
                 continue
             out.append(  # unknown object — best-effort attr read
                 {
-                    "price": getattr(f, "price", None),
+                    "price": _to_float(getattr(f, "price", None)),
                     "airline": getattr(f, "airline", getattr(f, "carrier", "unknown")),
                     "stops": getattr(f, "stops", "?"),
                     "duration": getattr(f, "duration", "?"),
@@ -206,7 +223,9 @@ def _normalize(raw, origin, dest, date) -> list[dict]:
                     "link": link,
                 }
             )
-    return [o for o in out if o.get("price")]
+    priced = [o for o in out if isinstance(o.get("price"), (int, float))]
+    priced.sort(key=lambda o: o["price"])
+    return priced[:15]  # truncate AFTER sort — cheapest survive, not first-scraped
 
 
 def _search_impl(origin, dest, date, cabin="economy", adults=1, currency="USD"):
@@ -658,7 +677,8 @@ def _price_signal_impl(route, date, disputed=False):
     key = os.environ.get("SERPAPI_KEY", "")
     if not key:
         return {"route": route, "date": date, "signal": "none",
-                "message": "SERPAPI_KEY absent — price_signal needs SerpAPI; skipping gracefully."}
+                "message": "SERPAPI_KEY absent — price_signal needs SerpAPI; skipping gracefully.",
+                "need_from_you": _need_from_you("serpapi_key")}
     def serp(fresh):
         params = {"engine": "google_flights", "departure_id": o, "arrival_id": d,
                   "outbound_date": date, "api_key": key,
@@ -693,6 +713,7 @@ def _price_signal_impl(route, date, disputed=False):
             "message": None if lowest is not None else "no price_insights in SerpAPI response"}
 
 
+@functools.lru_cache(maxsize=1)  # ponytail: static file only; restart to pick up edits
 def _load_bts():
     full = DATA_DIR / "ontime_full.json"  # BTS PREZIP drop-in (same shape, more rows)
     if full.exists():
@@ -787,6 +808,7 @@ _SAMPLE_CARDS = [
 ]
 
 
+@functools.lru_cache(maxsize=1)  # ponytail: file+24h-cache backed; restart to force refetch
 def _fetch_cards():
     """Vendor credit-card-bonuses-api JSON (raw first, GitHub discovery fallback, else samples)."""
     cache_paths = [DATA_DIR / "cards_cache.json", CACHE_DIR / "cards_cache.json"]
@@ -858,6 +880,7 @@ _ISSUERS = {"CHASE": "Chase", "AMERICAN_EXPRESS": "Amex", "CAPITAL_ONE": "CapOne
 _TRANSFERABLE = {"CHASE", "AMERICAN_EXPRESS", "CAPITAL_ONE", "CITI", "WELLS_FARGO", "US_BANK"}
 
 
+@functools.lru_cache(maxsize=64)  # ponytail: cpp.json is static; per-issuer memo
 def _issuer_cpp(issuer):
     try:
         d = _load_json("cpp.json")
@@ -941,7 +964,8 @@ def _score_cards(cards, profile):
 def _card_pick_impl(spend_profile):
     profile = {str(k).lower(): float(v) for k, v in (spend_profile or {}).items()}
     if not profile or sum(profile.values()) <= 0:
-        return {"error": "spend_profile needed, e.g. {dining: 500, travel: 800, groceries: 600, other: 1500} (monthly $)"}
+        return {"error": "spend_profile needed, e.g. {dining: 500, travel: 800, groceries: 600, other: 1500} (monthly $)",
+                "need_from_you": _need_from_you("spend")}
     cards, origin = _fetch_cards()
     top = _score_cards(cards, profile)[:3]
     return {"spend_profile_monthly": spend_profile, "cards_considered": len(cards),
@@ -971,8 +995,14 @@ _NEED_GUIDE = {
                    "why": "GDS cash anchor beats scrape estimates",
                    "how": "paste key from duffel.com dashboard as env DUFFEL_API_KEY_LIVE (scrape fallback otherwise)"},
     "delta_curl": {"field": "DELTA_CURL_FILE",
-                   "why": "Delta cookie-replay borrows your own delta.com session",
-                   "how": "devtools Network → copy the rm-offer-gql request as cURL → save to a file → set DELTA_CURL_FILE to its path (cookies expire ~30 min)"},
+                  "why": "Delta cookie-replay borrows your own delta.com session",
+                  "how": "devtools Network → copy the rm-offer-gql request as cURL → save to a file → set DELTA_CURL_FILE to its path (cookies expire ~30 min)"},
+    "serpapi_key": {"field": "SERPAPI_KEY",
+                    "why": "unlocks SerpAPI price_insights fallback/cross-check (250 free/mo)",
+                    "how": "paste key from serpapi.com dashboard as env SERPAPI_KEY (scrape fallback otherwise)"},
+    "spend": {"field": "spend_profile", "example": "{dining: 500, travel: 800, groceries: 600, other: 1500}",
+              "why": "card math is spend-weighted; no profile means no ranking",
+              "how": "paste monthly $ per category (dining / travel / groceries / other)"},
 }
 
 
@@ -1113,7 +1143,12 @@ _NEARBY = {  # pfei-sa/seats-aero-viz CITY_TO_IATA pattern (MIT): metro expansio
 }
 
 _SAVER_TOTAL_CAPS = {"american": 100000, "aa": 100000, "aadvantage": 100000,
-                      "alaska": 150000, "as": 150000}  # borski thresholds (MIT)
+                      "alaska": 150000, "as": 150000,
+                      # ponytail: conservative one-way totals, not per-cabin — tighten per cabin when data exists
+                      "delta": 100000, "skymiles": 100000,
+                      "united": 100000, "mileageplus": 100000, "ua": 100000,
+                      "korean air": 120000, "ke": 120000, "skypass": 120000,
+                      "asiana": 120000, "oz": 120000}  # borski thresholds (MIT) + safe defaults
 
 
 def _saver_flag(program, miles, max_miles=30000):
@@ -1194,7 +1229,7 @@ def _award_calendar_impl(route, date=None, dates=None, window=7, max_miles=30000
         except ValueError:
             return {"error": "date must be YYYY-MM-DD",
                     "need_from_you": _need_from_you("date")}
-        window = max(0, min(int(window), 15))
+        window = max(0, min(int(window), 14))
         days = [(c + datetime.timedelta(days=i)).isoformat() for i in range(-window, window + 1)]
     else:
         return {"error": "pass date=YYYY-MM-DD or dates=[...]",
@@ -1539,8 +1574,9 @@ def _duffel_anchor(origin, dest, date, cabin="economy", adults=1):
             timeout=30))
         r.raise_for_status()
         offers = (r.json().get("data") or {}).get("offers") or []
-        priced = [float(x["total_amount"]) for x in offers
+        priced = [_to_float(x["total_amount"]) for x in offers
                   if isinstance(x, dict) and x.get("total_amount") not in (None, "")]
+        priced = [p for p in priced if p is not None]
         if not priced:
             return None
         anchor = {"price": min(priced), "source": "duffel",
@@ -1654,7 +1690,7 @@ def _searxng_read(url):
     base = os.environ.get("SEARXNG_URL", "http://localhost:8080").rstrip("/")
     q = urllib.parse.quote(url, safe="")
     for u in (f"{base}/read?url={q}", f"{base}/search?format=json&q={q}"):
-        r = httpx.get(u, timeout=20, headers={"Accept": "application/json, text/html, text/plain"})
+        r = _httpx().get(u, timeout=20, headers={"Accept": "application/json, text/html, text/plain"})
         r.raise_for_status()
         if "json" in r.headers.get("content-type", ""):
             d = r.json()
@@ -1671,7 +1707,7 @@ def _searxng_read(url):
 
 def _jina_read(url):
     """Jina Reader keyless (20 RPM free). Raises on failure."""
-    r = httpx.get("https://r.jina.ai/" + url, timeout=30, headers={"Accept": "text/plain"})
+    r = _httpx().get("https://r.jina.ai/" + url, timeout=30, headers={"Accept": "text/plain"})
     r.raise_for_status()
     if len(r.text) < 500:
         raise RuntimeError(f"jina: suspiciously short ({len(r.text)} chars)")
